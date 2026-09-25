@@ -335,6 +335,111 @@ def _snapshot_target_windows(pids: list[int]) -> list[WindowDiagnostic]:
 snapshot_target_windows = _snapshot_target_windows
 
 
+# --------------------------------------------------------------------------
+# Pure Win32 window detection (Phase 1B.2): ZERO pywinauto/UIA/COM.
+#
+# Root cause found and fixed (Fase 1B.1 diagnostic, 2026-09-25): the ~45-90s
+# "waits" for PDF Options/Guardar como/the final Exportar dialog were NEVER
+# GO being slow to render -- a live race proved each dialog exists within
+# ~1-3 seconds of the click, confirmed by a pure Win32 EnumWindows check,
+# while the OLD detector (``enumerate_all_windows`` -> pywinauto
+# ``Desktop(backend="uia").windows()``, which reads a UIA property on every
+# top-level window on the desktop, including GO's own busy windows) did not
+# see the SAME dialog even after 60+ seconds. The delay was entirely inside
+# our own UIA enumeration, not GO's rendering. These primitives replace that
+# enumeration on the hot polling path for every dialog wait in this package;
+# UIA is only ever attached AFTER a Win32 hwnd is already known (via
+# :func:`connect_uia`), to interact with that one window's own controls --
+# never again to discover *which* window newly appeared.
+# --------------------------------------------------------------------------
+
+
+def win32_pure_find_all_windows(
+    pid: int, title_contains_any: tuple[str, ...], class_equals: str | None = None
+) -> list[int]:
+    """Zero UIA/COM. ``EnumWindows`` + ``GetWindowText``/``GetClassName``
+    only. Returns EVERY matching VISIBLE top-level hwnd owned by ``pid``, in
+    ``EnumWindows`` (Z-order, not creation-order) order. Never touches
+    pywinauto/COM in any way.
+
+    Callers doing "require a genuinely NEW window" filtering (see
+    :func:`clinica_rpa.automation.waits.win32_wait_for_window`) MUST use
+    this -- not the single-result :func:`win32_pure_find_window` -- because
+    Z-order is not creation order: a stale already-open match (e.g. a
+    lingering dialog from a prior interrupted run) can be enumerated before
+    a genuinely new one, silently starving a before/after ``require_new``
+    check that only ever looks at one hwnd (review finding
+    R3-win32-first-match-masks-new-window).
+    """
+    import win32gui
+    import win32process
+
+    found: list[int] = []
+
+    def _cb(hwnd, _extra):
+        try:
+            _, wpid = win32process.GetWindowThreadProcessId(hwnd)
+        except Exception:
+            return True
+        if wpid != pid:
+            return True
+        try:
+            if not win32gui.IsWindowVisible(hwnd):
+                return True
+            title = win32gui.GetWindowText(hwnd)
+            cls = win32gui.GetClassName(hwnd)
+        except Exception:
+            return True
+        title_ok = any(t.lower() in title.lower() for t in title_contains_any)
+        class_ok = class_equals is None or cls == class_equals
+        if title_ok and class_ok:
+            found.append(hwnd)
+        return True
+
+    win32gui.EnumWindows(_cb, None)
+    return found
+
+
+def win32_pure_find_window(
+    pid: int, title_contains_any: tuple[str, ...], class_equals: str | None = None
+) -> int | None:
+    """Zero UIA/COM. Returns the first matching VISIBLE top-level hwnd
+    owned by ``pid``, or None -- single-match convenience wrapper around
+    :func:`win32_pure_find_all_windows` for callers that only ever expect
+    at most one match (e.g. an "is it already open?" pre-check) and never
+    do before/after ``require_new`` filtering."""
+    found = win32_pure_find_all_windows(pid, title_contains_any, class_equals)
+    return found[0] if found else None
+
+
+def win32_pure_snapshot_hwnds(pid: int) -> set[int]:
+    """Zero UIA/COM. Every currently-visible top-level hwnd owned by
+    ``pid`` -- used as a "before" baseline so a subsequent
+    :func:`win32_pure_find_window` poll can require a genuinely NEW window,
+    the same discipline the UIA-based waits already used."""
+    import win32gui
+    import win32process
+
+    found: set[int] = set()
+
+    def _cb(hwnd, _extra):
+        try:
+            _, wpid = win32process.GetWindowThreadProcessId(hwnd)
+        except Exception:
+            return True
+        if wpid != pid:
+            return True
+        try:
+            if win32gui.IsWindowVisible(hwnd):
+                found.add(hwnd)
+        except Exception:
+            pass
+        return True
+
+    win32gui.EnumWindows(_cb, None)
+    return found
+
+
 def _search_content(controls: list[ControlInfo]) -> list[str]:
     haystack_parts = [f"{c.name} {c.automation_id} {c.class_name}" for c in controls]
     haystack = " ".join(haystack_parts)
@@ -345,7 +450,10 @@ def find_authenticated_go_window(
     pids: list[int],
     all_windows: list[WindowDiagnostic],
     require_favoritos_signals: bool = True,
-) -> WindowDiagnostic:
+    scan_max_depth: int = 10,
+    scan_timeout_seconds: float = 10.0,
+    return_controls: bool = False,
+):
     """Find the single top-level GO window proven to be authenticated content.
 
     Mirrors ``poc_move_to_trazabilidad.find_authenticated_go_window``: by
@@ -354,6 +462,18 @@ def find_authenticated_go_window(
     STRONG_SIGNAL_TEXTS match -- appropriate once GO has already navigated
     away from Favoritos (e.g. to Trazabilidad de Factura).
 
+    Phase 1B.1 optimization: this already has to fully scan each candidate
+    window to check its content. When ``return_controls=True``, it returns
+    ``(window, controls)`` instead of just ``window`` -- the winning
+    candidate's own already-scanned controls -- so a caller (like
+    ``_go_discovery``) that needs BOTH "which window is GO" AND "its
+    control tree" no longer has to perform a second full walk of the same
+    window right after this one. Measured live (2026-09-25): this exact
+    duplicate scan cost ~0.6-1.4s. ``scan_max_depth``/``scan_timeout_seconds``
+    let a caller request the SAME depth/timeout it would have used for its
+    own separate scan, so reusing this result never loses coverage compared
+    to the two-scan version.
+
     Raises:
         WindowNotFoundError: no candidate matches.
         GoAmbiguousError: more than one candidate matches.
@@ -361,9 +481,10 @@ def find_authenticated_go_window(
     top_level = [w for w in all_windows if w.process_id in pids and w.visible and not w.minimized]
 
     matches: list[WindowDiagnostic] = []
+    matched_controls: dict[int, list[ControlInfo]] = {}
     for w in top_level:
         try:
-            controls = _scan_window_controls(w.handle, max_depth=10, timeout_seconds=10.0)
+            controls = _scan_window_controls(w.handle, max_depth=scan_max_depth, timeout_seconds=scan_timeout_seconds)
         except Exception as exc:
             _classify_and_log(exc, f"fallo inspeccionando ventana candidata {w.handle}")
             continue
@@ -376,6 +497,7 @@ def find_authenticated_go_window(
             is_match = bool(matched_strong)
         if is_match:
             matches.append(w)
+            matched_controls[w.handle] = controls
 
     if not matches:
         raise WindowNotFoundError(
@@ -385,7 +507,10 @@ def find_authenticated_go_window(
         raise GoAmbiguousError(
             f"{len(matches)} ventanas autenticadas de GO encontradas simultaneamente."
         )
-    return matches[0]
+    winner = matches[0]
+    if return_controls:
+        return winner, matched_controls[winner.handle]
+    return winner
 
 
 # --------------------------------------------------------------------------
@@ -446,18 +571,39 @@ def walk_tree(
 
 
 def _scan_window_controls(handle: int, max_depth: int, timeout_seconds: float) -> list[ControlInfo]:
-    """Bounded, read-only UIA scan. Never raises: degrades to []."""
+    """Bounded, read-only UIA scan. Never raises: degrades to [].
+
+    Phase 1B.1 instrumentation: logs ``PERF WALK_TREE`` with element count
+    and elapsed time for every call -- this is the single choke point used
+    by GO_DISCOVERY, the OPEN_TRAZABILIDAD retry loop, and every
+    WAIT_INVOICE_RESULT poll tick, so this one log line answers "how much
+    does one full tree walk of this window cost, and how many elements
+    does it visit" for all three call sites without touching each of them
+    individually.
+    """
+    t0 = time.monotonic()
     try:
         element = connect_uia(handle)
     except Exception as exc:
         _classify_and_log(exc, f"fallo (no fatal) reconectando via UIA a ventana {handle}")
+        logger.info("PERF UIA_CONNECT {:.0f}ms FAIL", (time.monotonic() - t0) * 1000.0)
         return []
+    connect_ms = (time.monotonic() - t0) * 1000.0
     deadline = time.monotonic() + timeout_seconds
+    t1 = time.monotonic()
     try:
-        return walk_tree(element, max_depth=max_depth, deadline=deadline)
+        result = walk_tree(element, max_depth=max_depth, deadline=deadline)
     except Exception as exc:
         _classify_and_log(exc, f"fallo (no fatal) escaneando UIA de ventana {handle}")
+        logger.info("PERF WALK_TREE elements=0 {:.0f}ms FAIL (connect={:.0f}ms)", (time.monotonic() - t1) * 1000.0, connect_ms)
         return []
+    walk_ms = (time.monotonic() - t1) * 1000.0
+    hit_deadline = time.monotonic() > deadline
+    logger.info(
+        "PERF WALK_TREE elements={} depth<= {} {:.0f}ms hit_deadline={} (connect={:.0f}ms)",
+        len(result), max_depth, walk_ms, hit_deadline, connect_ms,
+    )
+    return result
 
 
 # Public alias -- see the note next to `snapshot_target_windows` above.
@@ -550,13 +696,24 @@ def supports_value_pattern(element) -> bool:
         return False
 
 
-def walk_live(element, visit, max_depth: int, deadline: float, depth: int = 0) -> None:
+def walk_live(element, visit, max_depth: int, deadline: float, depth: int = 0, stats: dict | None = None) -> None:
     """Bounded, read-only recursive walk over LIVE pywinauto elements.
 
     Never invokes/clicks anything -- `visit(element, depth)` is caller-owned
     and must stay read-only too. Every actual mutating action in this
     package happens later, from its own single dedicated call site.
+
+    Phase 1B.1 instrumentation (measurement only -- does NOT change
+    traversal behavior): when ``stats`` is provided, increments
+    ``stats['visited']`` once per node visited. This still walks the WHOLE
+    subtree even after ``visit()`` has recorded a match -- there is no
+    early-exit signal yet; ``stats['visited']`` exists specifically to let
+    a caller measure, with real numbers, exactly how many nodes a given
+    poll iteration walks (see Fase 1B.1's audit request) before any
+    early-exit optimization is applied.
     """
+    if stats is not None:
+        stats["visited"] = stats.get("visited", 0) + 1
     if deadline is not None and time.monotonic() > deadline:
         return
     visit(element, depth)
@@ -569,7 +726,7 @@ def walk_live(element, visit, max_depth: int, deadline: float, depth: int = 0) -
     for child in children:
         if deadline is not None and time.monotonic() > deadline:
             return
-        walk_live(child, visit, max_depth, deadline, depth + 1)
+        walk_live(child, visit, max_depth, deadline, depth + 1, stats=stats)
 
 
 def live_element_key(element) -> tuple:

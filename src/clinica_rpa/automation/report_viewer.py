@@ -28,6 +28,7 @@ import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
+from types import SimpleNamespace
 
 from loguru import logger
 
@@ -56,8 +57,10 @@ from clinica_rpa.automation.go_session import (
     supports_expand_collapse_pattern,
     verify_go_foreground,
     walk_live,
+    win32_pure_find_window,
+    win32_pure_snapshot_hwnds,
 )
-from clinica_rpa.automation.waits import find_mdi_child_live, light_wait_for_window
+from clinica_rpa.automation.waits import win32_wait_for_window
 from clinica_rpa.automation.trazabilidad import mask_invoice
 from clinica_rpa.domain.errors import ClinicaRpaError, ErrorCode
 
@@ -96,7 +99,6 @@ VIEWER_RECEIPT_PATH = Path("runtime") / "state" / "invoice_download_viewer_recei
 # time this fired, just detected too late. 30s matches the generosity
 # already applied to the Guardar como/final-dialog waits.
 DEFAULT_DOCUMENTO_ORIGEN_NO_EFFECT_TIMEOUT_SECONDS = 30.0
-DEFAULT_REPORT_VIEWER_TIMEOUT_SECONDS = 20.0
 # Widened from the PoC's own 10.0s default (Phase 1A live regression,
 # 2026-09-24, second observation): GO's overall backend responsiveness was
 # demonstrably slow during this session (56s end-to-end from Documento
@@ -105,7 +107,6 @@ DEFAULT_REPORT_VIEWER_TIMEOUT_SECONDS = 20.0
 # pipeline had already succeeded, only the read-only waits were too tight.
 DEFAULT_EXPORT_MENU_TIMEOUT_SECONDS = 20.0
 DEFAULT_PDF_OPTIONS_TIMEOUT_SECONDS = 45.0
-DEFAULT_LIGHT_POLL_INTERVAL_SECONDS = 0.5
 
 
 @dataclass
@@ -195,26 +196,31 @@ def open_documento_origen(
     max_depth: int,
     scan_timeout: float,
     no_effect_timeout: float = DEFAULT_DOCUMENTO_ORIGEN_NO_EFFECT_TIMEOUT_SECONDS,
-    poll_interval: float = DEFAULT_LIGHT_POLL_INTERVAL_SECONDS,
 ):
     """Locate and (if not already open for this invoice) click "Documento
-    Origen"'s value exactly once. Returns
-    ``(viewer_live_or_None, click_executed)`` -- ``viewer_live`` is the live
-    "Visor de Reportes" MDI child element if it already appeared during this
-    call, else ``None`` (the caller must still wait via
-    :func:`wait_for_report_viewer`); ``click_executed`` tells the caller
-    whether a fresh click happened (and therefore whether a new session
-    receipt should be saved).
+    Origen"'s value exactly once. Returns ``(viewer_hwnd, click_executed)``
+    -- ``viewer_hwnd`` is the "Visor de Reportes" window's raw Win32 handle
+    (an ``int``, NEVER None on a successful return -- this function raises
+    instead); ``click_executed`` tells the caller whether a fresh click
+    happened (and therefore whether a new session receipt should be saved).
+
+    Phase 1B.2: detection is now pure Win32 (``win32_pure_find_window`` /
+    ``win32_wait_for_window``) both for the "already open?" pre-check and
+    for the post-click wait -- confirmed live (Fase 1B.1 diagnostic,
+    2026-09-25) that "Visor de Reportes" is a genuine top-level Win32
+    window (findable via plain ``EnumWindows``), not a UIA-only construct.
+    The caller connects UIA directly to this hwnd only when it actually
+    needs to interact with the viewer's own controls (Regla: Win32 finds
+    the window, UIA only ever attaches to an already-known window).
 
     Raises:
         ClinicaRpaError(DOCUMENT_ORIGIN_NOT_FOUND): the value control could
             not be resolved, or did not match the requested invoice.
         ClinicaRpaError(UI_ACTION_AMBIGUOUS): the click raised.
-        ClinicaRpaError(REPORT_VIEWER_TIMEOUT): no MDI child/new window
-            appeared after the click within ``no_effect_timeout``.
+        ClinicaRpaError(REPORT_VIEWER_TIMEOUT): no new window appeared
+            after the click within ``no_effect_timeout``.
     """
     from clinica_rpa.automation.trazabilidad import _control_info_rect
-    from clinica_rpa.automation.go_session import _snapshot_target_windows
 
     label_candidates = [c for c in controls if matches_any(f"{c.name} {c.automation_id}", DOCUMENTO_ORIGEN_LABEL_VARIANTS)]
     if not label_candidates:
@@ -253,70 +259,49 @@ def open_documento_origen(
 
     # Pre-check: is a viewer already open for THIS invoice+process? Skip the
     # click entirely if so (Regla 1/14: verify state before acting).
-    viewer_live = find_mdi_child_live(
-        window, REPORT_VIEWER_AUTOMATION_ID_HINTS, REPORT_VIEWER_TITLE_HINTS, max_depth=min(LIVE_SEARCH_MAX_DEPTH, 14), timeout_seconds=5.0
-    )
-    if viewer_live is not None:
-        try:
-            preexisting_handle = int(viewer_live.handle)
-        except Exception:
-            preexisting_handle = 0
-        if preexisting_handle and viewer_receipt_matches(invoice, go_window.process_id, preexisting_handle):
+    # Phase 1B.2: pure Win32 (EnumWindows), never a UIA tree walk here.
+    viewer_hwnd = win32_pure_find_window(go_window.process_id, REPORT_VIEWER_TITLE_HINTS)
+    if viewer_hwnd is not None:
+        if viewer_receipt_matches(invoice, go_window.process_id, viewer_hwnd):
             logger.info("Visor de Reportes ya abierto y recibo coincide; se omite el clic en Documento Origen.")
-            return viewer_live, False
+            return viewer_hwnd, False
         raise ClinicaRpaError(
             ErrorCode.GO_STATE_UNKNOWN,
             "Hay un Visor de Reportes abierto sin recibo de sesion que lo vincule con esta descarga.",
         )
 
-    before_click_handles = {w.handle for w in _snapshot_target_windows(pids)}
+    before_hwnds = win32_pure_snapshot_hwnds(go_window.process_id)
+    _click_t0 = time.monotonic()
     try:
         verify_go_foreground(go_window.handle, expected_pid=go_window.process_id, allow_same_pid=False)
         activate_preselected_once(resolved_value_element)
     except Exception as exc:
+        logger.info("PERF DOCUMENT_ORIGIN_CLICK_CALL {:.0f}ms FAIL", (time.monotonic() - _click_t0) * 1000.0)
         _classify_and_log(exc, "fallo ejecutando el clic autorizado en Documento Origen")
         raise ClinicaRpaError(ErrorCode.UI_ACTION_AMBIGUOUS, "El clic en Documento Origen fallo de forma ambigua.") from exc
 
+    # Phase 1B.1 section 2: this is the pure action-execution cost (foreground
+    # check + the single click call itself) -- separate from the detection
+    # wait that follows, so a slow DOCUMENT_ORIGEN can be attributed to
+    # "the click was slow" vs. "our detector took a while to notice".
+    logger.info("PERF DOCUMENT_ORIGIN_CLICK_CALL {:.0f}ms OK", (time.monotonic() - _click_t0) * 1000.0)
+    logger.info("ACTION DOCUMENT_ORIGIN CLICKED")
     logger.info("Documento Origen: clic ejecutado (factura enmascarada={}).", mask_invoice(invoice))
 
-    deadline = time.monotonic() + no_effect_timeout
-    while viewer_live is None and time.monotonic() < deadline:
-        remaining = max(0.1, deadline - time.monotonic())
-        viewer_live = find_mdi_child_live(
-            window, REPORT_VIEWER_AUTOMATION_ID_HINTS, REPORT_VIEWER_TITLE_HINTS, max_depth=min(LIVE_SEARCH_MAX_DEPTH, 14), timeout_seconds=min(2.0, remaining)
-        )
-        if viewer_live is None:
-            time.sleep(poll_interval)
-
-    any_new_top_level = None
-    if viewer_live is None:
-        any_new_top_level = light_wait_for_window(
-            lambda: _snapshot_target_windows(pids), before_click_handles, lambda w: w.process_id == go_window.process_id, 1.0, poll_interval, require_new=True
-        )
-    if viewer_live is None and any_new_top_level is None:
+    _detect_t0 = time.monotonic()
+    viewer_hwnd = win32_wait_for_window(
+        go_window.process_id, REPORT_VIEWER_TITLE_HINTS, timeout_seconds=no_effect_timeout, before_hwnds=before_hwnds
+    )
+    logger.info(
+        "PERF REPORT_VIEWER_FIRST_DETECTION {:.0f}ms found={}", (time.monotonic() - _detect_t0) * 1000.0, viewer_hwnd is not None
+    )
+    if viewer_hwnd is None:
         raise ClinicaRpaError(
             ErrorCode.REPORT_VIEWER_TIMEOUT, "Documento Origen no produjo ningun efecto observable."
         )
+    logger.info("REPORT VIEWER DETECTED")
 
-    return viewer_live, True
-
-
-def wait_for_report_viewer(window, viewer_live, timeout_seconds: float = DEFAULT_REPORT_VIEWER_TIMEOUT_SECONDS, poll_interval: float = DEFAULT_LIGHT_POLL_INTERVAL_SECONDS):
-    """Wait (light polling) for the "Visor de Reportes" MDI child if it did
-    not already appear during the pre-check/no-effect window."""
-    if viewer_live is not None:
-        return viewer_live
-    deadline = time.monotonic() + timeout_seconds
-    while viewer_live is None and time.monotonic() < deadline:
-        remaining = max(0.1, deadline - time.monotonic())
-        viewer_live = find_mdi_child_live(
-            window, REPORT_VIEWER_AUTOMATION_ID_HINTS, REPORT_VIEWER_TITLE_HINTS, max_depth=min(LIVE_SEARCH_MAX_DEPTH, 14), timeout_seconds=min(2.0, remaining)
-        )
-        if viewer_live is None:
-            time.sleep(poll_interval)
-    if viewer_live is None:
-        raise ClinicaRpaError(ErrorCode.REPORT_VIEWER_TIMEOUT, "'Visor de Reportes' no aparecio a tiempo.")
-    return viewer_live
+    return viewer_hwnd, True
 
 
 # --------------------------------------------------------------------------
@@ -515,12 +500,16 @@ def _select_pdf_file_once(go_window: WindowDiagnostic, viewer_window, before_pop
     target_x = popup_rect.left + popup_rect.width // 2
     target_y = round(popup_rect.top + item_height * PDF_FILE_ITEM_INDEX + item_height / 2)
 
+    _click_t0 = time.monotonic()
     try:
         verify_go_foreground(viewer_window.handle, expected_pid=go_window.process_id, allow_same_pid=False)
         click_once(target_x, target_y)
     except Exception as exc:
+        logger.info("PERF PDF_FILE_CLICK_CALL {:.0f}ms FAIL", (time.monotonic() - _click_t0) * 1000.0)
         _classify_and_log(exc, "fallo seleccionando 'PDF File' por coordenada proporcional")
         raise ClinicaRpaError(ErrorCode.UI_ACTION_AMBIGUOUS, "La seleccion de 'PDF File' fallo de forma ambigua.") from exc
+    logger.info("PERF PDF_FILE_CLICK_CALL {:.0f}ms OK", (time.monotonic() - _click_t0) * 1000.0)
+    logger.info("ACTION PDF_FILE CLICKED")
 
 
 # --------------------------------------------------------------------------
@@ -528,15 +517,25 @@ def _select_pdf_file_once(go_window: WindowDiagnostic, viewer_window, before_pop
 # --------------------------------------------------------------------------
 
 
-def wait_for_pdf_options_dialog(pids: list[int], before_handles: set[int], go_process_id: int, timeout_seconds: float = DEFAULT_PDF_OPTIONS_TIMEOUT_SECONDS, poll_interval: float = DEFAULT_LIGHT_POLL_INTERVAL_SECONDS):
-    from clinica_rpa.automation.go_session import _snapshot_target_windows
+def wait_for_pdf_options_dialog(
+    pids: list[int],
+    before_handles: set[int],
+    go_process_id: int,
+    timeout_seconds: float = DEFAULT_PDF_OPTIONS_TIMEOUT_SECONDS,
+):
+    """Phase 1B.2: pure Win32 detection -- live-measured ~953ms, previously
+    misattributed to GO being slow (the old UIA-enumeration-based wait
+    never saw the same dialog within 60+ seconds). ``pids`` kept for
+    call-site compatibility, unused."""
+    from clinica_rpa.automation.waits import win32_wait_for_window
 
-    window = light_wait_for_window(
-        lambda: _snapshot_target_windows(pids), before_handles, lambda w: w.process_id == go_process_id and matches_any(w.title, PDF_OPTIONS_TITLE_HINTS), timeout_seconds, poll_interval, require_new=True
+    hwnd = win32_wait_for_window(
+        go_process_id, PDF_OPTIONS_TITLE_HINTS, class_equals=None, timeout_seconds=timeout_seconds, before_hwnds=set(before_handles)
     )
-    if window is None:
+    if hwnd is None:
         raise ClinicaRpaError(ErrorCode.PDF_OPTIONS_TIMEOUT, "El dialogo 'Opciones de Exportacion PDF' no aparecio a tiempo.")
-    return window
+    logger.info("PDF OPTIONS DETECTED")
+    return SimpleNamespace(handle=hwnd, process_id=go_process_id)
 
 
 def click_aceptar_once(pdf_options_window) -> None:

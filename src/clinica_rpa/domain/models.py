@@ -9,7 +9,18 @@ clinical content (Regla 6) -- only masked/structural values.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+
+
+@dataclass(frozen=True)
+class StageTiming:
+    """One instrumented stage's timing (Phase 1B). Never carries clinical
+    data or a raw invoice number -- only the stage name, elapsed
+    milliseconds, and a status token."""
+
+    stage: str
+    elapsed_ms: float
+    status: str  # "OK", "SKIPPED" (stage not needed this run), or "FAIL"
 
 
 @dataclass
@@ -20,6 +31,10 @@ class InvoiceDownloadResult:
     :class:`clinica_rpa.domain.errors.ErrorCode`) -- so a caller can always
     branch on ``status`` alone. ``error_code``/``error_message_safe`` are
     populated only when ``status != "COMPLETED"``.
+
+    ``stage_timings`` (Phase 1B): per-stage instrumentation, always
+    populated up to the point of success/failure -- safe to log/print in
+    full, never contains clinical data.
     """
 
     invoice_number_masked: str
@@ -31,6 +46,7 @@ class InvoiceDownloadResult:
     elapsed_seconds: float
     error_code: str | None
     error_message_safe: str | None
+    stage_timings: list[StageTiming] = field(default_factory=list)
 
 
 class GoState:

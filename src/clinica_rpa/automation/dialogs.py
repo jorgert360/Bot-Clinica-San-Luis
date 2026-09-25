@@ -15,6 +15,7 @@ from __future__ import annotations
 import time
 from datetime import datetime
 from pathlib import Path
+from types import SimpleNamespace
 
 from clinica_rpa.automation.go_session import (
     LIVE_SEARCH_MAX_DEPTH,
@@ -34,7 +35,7 @@ from clinica_rpa.automation.go_session import (
     walk_live,
     walk_tree,
 )
-from clinica_rpa.automation.waits import light_wait_for_window
+from clinica_rpa.automation.waits import light_wait_for_window, win32_wait_for_window
 from clinica_rpa.domain.errors import ClinicaRpaError, ErrorCode
 
 SAVE_DIALOG_TITLE_HINTS: tuple[str, ...] = ("guardar como", "save as")
@@ -133,20 +134,31 @@ def find_filename_edit_candidates_live(container, max_depth: int, timeout_second
 # --------------------------------------------------------------------------
 
 
-def wait_for_save_dialog(pids: list[int], before_handles: set[int], go_process_id: int, timeout_seconds: float = DEFAULT_SAVE_DIALOG_TIMEOUT_SECONDS, poll_interval: float = DEFAULT_LIGHT_POLL_INTERVAL_SECONDS) -> WindowDiagnostic:
-    from clinica_rpa.automation.go_session import enumerate_all_windows
-
-    window = light_wait_for_window(
-        enumerate_all_windows,
-        before_handles,
-        lambda w: w.process_id == go_process_id and SAVE_DIALOG_CLASS_HINT in w.class_name and matches_any(w.title, SAVE_DIALOG_TITLE_HINTS),
-        timeout_seconds,
-        poll_interval,
-        require_new=True,
+def wait_for_save_dialog(
+    pids: list[int],
+    before_handles: set[int],
+    go_process_id: int,
+    timeout_seconds: float = DEFAULT_SAVE_DIALOG_TIMEOUT_SECONDS,
+):
+    """Phase 1B.2: pure Win32 detection (see module docstring reference in
+    ``waits.win32_wait_for_window``) -- live-measured ~922ms, previously
+    misattributed to GO being slow because the old UIA-enumeration-based
+    wait never saw the same dialog within 60+ seconds. ``pids`` is kept in
+    the signature for call-site compatibility but is no longer used --
+    detection is now scoped to the single already-resolved
+    ``go_process_id`` (this session's own authenticated GO process).
+    """
+    before_hwnds = {h for h in before_handles}
+    hwnd = win32_wait_for_window(
+        go_process_id,
+        SAVE_DIALOG_TITLE_HINTS,
+        class_equals=SAVE_DIALOG_CLASS_HINT,
+        timeout_seconds=timeout_seconds,
+        before_hwnds=before_hwnds,
     )
-    if window is None:
+    if hwnd is None:
         raise ClinicaRpaError(ErrorCode.SAVE_DIALOG_TIMEOUT, "El dialogo 'Guardar como' no aparecio a tiempo.")
-    return window
+    return SimpleNamespace(handle=hwnd, process_id=go_process_id)
 
 
 def compute_destination_path(destination_directory: Path, invoice: str) -> Path:
@@ -171,9 +183,13 @@ def compute_destination_path(destination_directory: Path, invoice: str) -> Path:
     return destination
 
 
-def write_save_path_once_and_click_guardar(save_window: WindowDiagnostic, destination: Path) -> None:
+def write_destination_path_once(save_window: WindowDiagnostic, destination: Path):
     """Write the destination path into the filename field (ValuePattern
-    only, exactly once) and click Guardar exactly once."""
+    only, exactly once). Returns the connected save-dialog live element
+    (``save_live``) so the caller can pass it to
+    :func:`click_guardar_once` without re-resolving the dialog (Phase 1B:
+    split from the combined write+click so each has its own timing stage).
+    """
     try:
         save_live = connect_uia(save_window.handle)
     except Exception as exc:
@@ -193,6 +209,13 @@ def write_save_path_once_and_click_guardar(save_window: WindowDiagnostic, destin
         _classify_and_log(exc, "fallo escribiendo la ruta destino mediante ValuePattern")
         raise ClinicaRpaError(ErrorCode.UI_ACTION_AMBIGUOUS, "La escritura de la ruta destino fallo de forma ambigua.") from exc
 
+    return save_live
+
+
+def click_guardar_once(save_window: WindowDiagnostic, save_live) -> None:
+    """Click Guardar exactly once, on the SAME live dialog element already
+    connected by :func:`write_destination_path_once` (never re-searches
+    the filename field -- only the Guardar button)."""
     save_button_candidates = find_button_candidates_live(save_live, SAVE_BUTTON_STRONG_VARIANTS, REJECT_BUTTON_VARIANTS, LIVE_SEARCH_MAX_DEPTH, LIVE_SEARCH_TIMEOUT_SECONDS)
     if not save_button_candidates:
         save_button_candidates = find_button_candidates_live(save_live, SAVE_BUTTON_WEAK_VARIANTS, REJECT_BUTTON_VARIANTS, LIVE_SEARCH_MAX_DEPTH, LIVE_SEARCH_TIMEOUT_SECONDS)
@@ -208,20 +231,37 @@ def write_save_path_once_and_click_guardar(save_window: WindowDiagnostic, destin
         raise ClinicaRpaError(ErrorCode.UI_ACTION_AMBIGUOUS, "El clic en Guardar fallo de forma ambigua.") from exc
 
 
+def write_save_path_once_and_click_guardar(save_window: WindowDiagnostic, destination: Path) -> None:
+    """Convenience wrapper preserved for callers that don't need per-stage
+    timing (e.g. ad-hoc diagnostics) -- write the path, then click Guardar,
+    as two calls under the hood."""
+    save_live = write_destination_path_once(save_window, destination)
+    click_guardar_once(save_window, save_live)
+
+
 # --------------------------------------------------------------------------
 # Final "Exportar" dialog: click "No", NEVER "Si"
 # --------------------------------------------------------------------------
 
 
-def wait_for_final_export_dialog(pids: list[int], before_handles: set[int], go_process_id: int, timeout_seconds: float = DEFAULT_FINAL_DIALOG_TIMEOUT_SECONDS, poll_interval: float = DEFAULT_LIGHT_POLL_INTERVAL_SECONDS) -> WindowDiagnostic:
-    from clinica_rpa.automation.go_session import _snapshot_target_windows
-
-    window = light_wait_for_window(
-        lambda: _snapshot_target_windows(pids), before_handles, lambda w: w.process_id == go_process_id and matches_any(w.title, FINAL_DIALOG_TITLE_HINTS), timeout_seconds, poll_interval, require_new=True
+def wait_for_final_export_dialog(
+    pids: list[int],
+    before_handles: set[int],
+    go_process_id: int,
+    timeout_seconds: float = DEFAULT_FINAL_DIALOG_TIMEOUT_SECONDS,
+):
+    """Phase 1B.2: pure Win32 detection -- live-measured ~2.7s. ``pids``
+    kept for call-site compatibility, unused (see :func:`wait_for_save_dialog`)."""
+    hwnd = win32_wait_for_window(
+        go_process_id,
+        FINAL_DIALOG_TITLE_HINTS,
+        class_equals=None,
+        timeout_seconds=timeout_seconds,
+        before_hwnds=set(before_handles),
     )
-    if window is None:
+    if hwnd is None:
         raise ClinicaRpaError(ErrorCode.FINAL_DIALOG_TIMEOUT, "El dialogo final 'Exportar' no aparecio a tiempo.")
-    return window
+    return SimpleNamespace(handle=hwnd, process_id=go_process_id)
 
 
 def click_final_no_once(final_window: WindowDiagnostic) -> None:

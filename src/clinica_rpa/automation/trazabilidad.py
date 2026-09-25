@@ -417,22 +417,38 @@ def wait_for_search_result(
     Returns (active_enough, not_found_evidence, populated_count).
     """
     start = time.monotonic()
+    iterations = 0
+    scan_ms_total = 0.0
     while True:
+        iterations += 1
+        _scan_t0 = time.monotonic()
         try:
             controls = scan_fn()
         except Exception:
             controls = []
+        scan_ms_total += (time.monotonic() - _scan_t0) * 1000.0
         if controls:
             active_enough, populated_count = validate_invoice_result_active(controls)
             not_found = check_not_found_evidence(controls)
             if active_enough or not_found:
+                logger.info(
+                    "PERF POLL_LOOP invoice_result iterations={} scan_ms_total={:.0f}ms {:.0f}ms found=True",
+                    iterations, scan_ms_total, (time.monotonic() - start) * 1000.0,
+                )
                 return active_enough, not_found, populated_count
         if time.monotonic() - start > timeout_seconds:
+            iterations += 1
+            _scan_t0 = time.monotonic()
             try:
                 controls = scan_fn()
             except Exception:
                 controls = []
+            scan_ms_total += (time.monotonic() - _scan_t0) * 1000.0
             active_enough, populated_count = validate_invoice_result_active(controls) if controls else (False, 0)
             not_found = check_not_found_evidence(controls) if controls else False
+            logger.info(
+                "PERF POLL_LOOP invoice_result iterations={} scan_ms_total={:.0f}ms {:.0f}ms found={}",
+                iterations, scan_ms_total, (time.monotonic() - start) * 1000.0, active_enough or not_found,
+            )
             return active_enough, not_found, populated_count
         time.sleep(poll_interval)

@@ -20,18 +20,28 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
+from loguru import logger
+
 from clinica_rpa.automation.go_session import (
     WindowDiagnostic,
     live_element_automation_id,
     live_element_control_type,
     live_element_name,
     walk_live,
+    win32_pure_find_all_windows,
 )
 from clinica_rpa.automation.go_session import _matches_any as matches_any
 
 DEFAULT_LIGHT_POLL_INTERVAL_SECONDS = 0.5
 FILE_WAIT_POLL_INTERVAL_SECONDS = 0.5
 FILE_STABLE_READS_REQUIRED = 3
+
+# Phase 1B.2: cheap poll interval for the Win32-pure dialog waits -- each
+# tick is a single EnumWindows pass (sub-millisecond in practice), so this
+# can be much tighter than the UIA-based DEFAULT_LIGHT_POLL_INTERVAL_SECONDS
+# without risking any nested-timeout budget violation (inner_operation_time
+# << outer timeout, per Fase 1B.2 section 8).
+WIN32_POLL_INTERVAL_SECONDS = 0.15
 
 # Progressive backoff schedule for window/dialog waits (mission "ESPERAS"
 # example: 0.5s/1s/1.5s/2s/2s...), never a flat tight loop. The schedule
@@ -71,18 +81,85 @@ def light_wait_for_window(
     """
     start = time.monotonic()
     interval = poll_interval
+    iterations = 0
+    enum_ms_total = 0.0
     while True:
+        iterations += 1
+        _enum_t0 = time.monotonic()
         try:
             windows = window_source_fn()
         except Exception:
             windows = []
+        enum_ms_total += (time.monotonic() - _enum_t0) * 1000.0
         for w in windows:
             if (not require_new or w.handle not in before_handles) and predicate(w):
+                logger.info(
+                    "PERF LIGHT_WAIT_FOR_WINDOW iterations={} enum_ms_total={:.0f}ms {:.0f}ms found=True",
+                    iterations, enum_ms_total, (time.monotonic() - start) * 1000.0,
+                )
                 return w
         if time.monotonic() - start > timeout_seconds:
+            logger.info(
+                "PERF LIGHT_WAIT_FOR_WINDOW iterations={} enum_ms_total={:.0f}ms {:.0f}ms found=False",
+                iterations, enum_ms_total, (time.monotonic() - start) * 1000.0,
+            )
             return None
         time.sleep(interval)
         interval = _next_backoff_interval(interval)
+
+
+def win32_wait_for_window(
+    pid: int,
+    title_contains_any: tuple[str, ...],
+    class_equals: str | None = None,
+    timeout_seconds: float = 20.0,
+    poll_interval: float = WIN32_POLL_INTERVAL_SECONDS,
+    before_hwnds: set[int] | None = None,
+) -> int | None:
+    """Phase 1B.2: the PRIMARY dialog-wait mechanism for this package.
+
+    Pure Win32 (``win32_pure_find_window``) on every tick -- ZERO
+    pywinauto/UIA/COM calls anywhere in this loop. Each tick is a single
+    cheap ``EnumWindows`` pass; ``inner_operation_time`` is therefore always
+    far smaller than ``timeout_seconds`` (Fase 1B.2 section 8 -- no nested
+    timeout budget violation is possible here, unlike the old
+    UIA-enumeration-based wait this replaces).
+
+    Live-measured (Fase 1B.1 diagnostic, 2026-09-25): PDF Options ~953ms,
+    Guardar como ~922ms, the final Exportar dialog ~2.7s -- all previously
+    misattributed to "GO is slow" because the OLD UIA-based detector never
+    saw them within 60+ seconds despite the window genuinely existing
+    within ~1-3s.
+
+    Returns the found hwnd, or None on timeout. When ``before_hwnds`` is
+    given, only a hwnd NOT already in that set counts (mirrors
+    :func:`light_wait_for_window`'s ``require_new`` semantics) -- every
+    matching hwnd is checked, not just the first one ``EnumWindows``
+    happens to enumerate, since Z-order is not creation order and a stale
+    already-open match could otherwise mask a genuinely new one (review
+    finding R3-win32-first-match-masks-new-window).
+
+    A single enumeration failure is tolerated and retried on the next tick
+    (mirrors :func:`light_wait_for_window`'s own tolerance of a transient
+    read failure) rather than escaping as a raw exception that would be
+    misreported as GO_STATE_UNKNOWN instead of the caller's specific
+    dialog-timeout error code (review finding
+    R3-win32-wait-exceptions-unhandled).
+    """
+    start = time.monotonic()
+    while True:
+        try:
+            candidates = win32_pure_find_all_windows(pid, title_contains_any, class_equals)
+        except Exception:
+            candidates = []
+        for hwnd in candidates:
+            if before_hwnds is None or hwnd not in before_hwnds:
+                logger.info("PERF WIN32_WAIT_FOR_WINDOW {:.0f}ms found=True", (time.monotonic() - start) * 1000.0)
+                return hwnd
+        if time.monotonic() - start > timeout_seconds:
+            logger.info("PERF WIN32_WAIT_FOR_WINDOW {:.0f}ms found=False", (time.monotonic() - start) * 1000.0)
+            return None
+        time.sleep(poll_interval)
 
 
 def find_mdi_child_live(
@@ -101,6 +178,7 @@ def find_mdi_child_live(
     """
     deadline = time.monotonic() + timeout_seconds
     found: list = []
+    stats: dict = {}
 
     def _visit(element, _depth):
         ctype = live_element_control_type(element)
@@ -114,7 +192,18 @@ def find_mdi_child_live(
         if matches_any(name, title_hints):
             found.append(element)
 
-    walk_live(container, _visit, max_depth, deadline)
+    t0 = time.monotonic()
+    walk_live(container, _visit, max_depth, deadline, stats=stats)
+    elapsed_ms = (time.monotonic() - t0) * 1000.0
+    # Phase 1B.1 instrumentation (measurement only): this walk currently
+    # visits the WHOLE subtree regardless of when `found` was populated --
+    # `visited` == total nodes walked, not "nodes walked until match". If
+    # `found` is non-empty but `visited` is large, that gap IS the exact
+    # "kept walking after finding the target" waste the audit asked about.
+    logger.info(
+        "PERF WALK_LIVE find_mdi_child_live elements={} {:.0f}ms found={}",
+        stats.get("visited", 0), elapsed_ms, bool(found),
+    )
     return found[0] if found else None
 
 
