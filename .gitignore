@@ -1,3 +1,6 @@
+# Local tooling cache
+.atl/
+
 # Python
 __pycache__/
 *.pyc
