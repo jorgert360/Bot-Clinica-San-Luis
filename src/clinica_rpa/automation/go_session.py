@@ -527,6 +527,40 @@ def connect_uia(handle: int):
     return element
 
 
+def uia_find_first_by_automation_id(root_element, automation_id: str):
+    """Single cheap targeted UIA search -- NEVER a Python-side tree walk.
+
+    Phase 1B close-out: this installed pywinauto's ``descendants(auto_id=)``
+    raises ``TypeError`` (its ``build_condition()`` only accepts
+    process/class_name/title/control_type -- confirmed live, Fase 1B.3).
+    Uses the raw ``IUIAutomation`` COM ``FindFirst`` with a genuine
+    ``UIA_AutomationIdPropertyId`` condition instead, letting UIA's own
+    provider do the search natively (proven live, Fase 1B.3 diagnostic,
+    2026-09-25: 562-1969ms, versus 3-5s+ for a full
+    :func:`scan_window_controls` walk). Returns the raw
+    ``IUIAutomationElement``, or None. Read-only.
+
+    Like any UIA call against GO's window, this CAN still block for GO's
+    own confirmed ~42-46s unresponsive window (Fase 1B.3:
+    GO_QUERY_REAL_WAIT_CONFIRMED) if issued while GO's UI thread is busy --
+    it is cheap when GO is responsive, not immune to GO's freeze.
+    """
+    from pywinauto.uia_defines import IUIA
+
+    ui = IUIA()
+    condition = ui.iuia.CreatePropertyCondition(ui.UIA_dll.UIA_AutomationIdPropertyId, automation_id)
+    raw_root = root_element.element_info._element
+    return raw_root.FindFirst(ui.ui_automation_client.TreeScope_Descendants, condition)
+
+
+def uia_raw_element_name(raw_element) -> str:
+    """Read ``CurrentName`` off a raw ``IUIAutomationElement`` (e.g. from
+    :func:`uia_find_first_by_automation_id`). Never raises for a None
+    name."""
+    name = raw_element.CurrentName
+    return name if name is not None else ""
+
+
 def walk_tree(
     element,
     max_depth: int = LIVE_SEARCH_MAX_DEPTH,

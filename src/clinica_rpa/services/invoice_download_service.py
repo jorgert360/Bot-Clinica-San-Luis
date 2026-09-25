@@ -259,14 +259,17 @@ def _trigger_search(go_window, element) -> None:
         raise ClinicaRpaError(ErrorCode.UI_ACTION_AMBIGUOUS, "El disparo de la busqueda (Enter) fallo de forma ambigua.") from exc
 
 
-def _wait_invoice_result(go_window, max_depth: int, scan_timeout: float) -> None:
-    """WAIT_INVOICE_RESULT stage: read-only progressive poll, never a
-    second mutation."""
+def _wait_invoice_result(go_window, window, max_depth: int, scan_timeout: float) -> None:
+    """WAIT_INVOICE_RESULT stage: cheap sentinel poll + one final full
+    validation, never a second mutation. See
+    :func:`clinica_rpa.automation.trazabilidad.wait_for_search_result`."""
 
     def _scan() -> list:
         return go_session.scan_window_controls(go_window.handle, max_depth, scan_timeout)
 
-    active_enough, not_found, _populated_count = trazabilidad.wait_for_search_result(_scan, timeout_seconds=DEFAULT_SEARCH_TIMEOUT_SECONDS)
+    active_enough, not_found, _populated_count = trazabilidad.wait_for_search_result(
+        window, _scan, timeout_seconds=DEFAULT_SEARCH_TIMEOUT_SECONDS
+    )
     if active_enough:
         logger.info("INVOICE RESULT DETECTED")
     if not active_enough:
@@ -354,7 +357,7 @@ def process_invoice(invoice_number: str, destination_directory: Path) -> Invoice
 
         element = stage.run("INVOICE_WRITE", _write_invoice, go_window, window, invoice)
         stage.run("INVOICE_SEARCH", _trigger_search, go_window, element)
-        stage.run("WAIT_INVOICE_RESULT", _wait_invoice_result, go_window, DEFAULT_MAX_DEPTH, DEFAULT_SCAN_TIMEOUT_SECONDS)
+        stage.run("WAIT_INVOICE_RESULT", _wait_invoice_result, go_window, window, DEFAULT_MAX_DEPTH, DEFAULT_SCAN_TIMEOUT_SECONDS)
 
         controls = go_session.scan_window_controls(go_window.handle, DEFAULT_MAX_DEPTH, DEFAULT_SCAN_TIMEOUT_SECONDS)
         viewer_handle, click_executed = stage.run(
