@@ -12,6 +12,7 @@ populated-or-not + length, exactly like the PoC (never the real value).
 
 from __future__ import annotations
 
+import threading
 import time
 from dataclasses import dataclass
 
@@ -26,6 +27,8 @@ from clinica_rpa.automation.go_session import (
     load_calibration,
     locate_content_panel,
     resolve_target_point,
+    uia_find_first_by_automation_id,
+    uia_raw_element_name,
     verify_go_foreground,
 )
 from clinica_rpa.domain.errors import ClinicaRpaError, ErrorCode
@@ -75,8 +78,26 @@ VERTICAL_CENTER_TOLERANCE_PX = 10
 
 NOT_FOUND_TEXT_HINTS: tuple[str, ...] = ("no encontrado", "no encontrada", "no existe", "sin resultados")
 
-DEFAULT_SEARCH_POLL_TIMEOUT_SECONDS = 15.0
+# Phase 1B close-out (2026-09-25): live-confirmed by the user
+# (GO_QUERY_REAL_WAIT_CONFIRMED) that GO's own backend genuinely takes
+# ~45-50s to resolve an invoice search -- Fase 1B.3's independent-detector
+# diagnostic proved this is GO's UI thread itself being unresponsive to
+# ANY UIA call during that window, not an artifact of our detection
+# strategy. This can no longer be optimized away from Python; the timeout
+# below is a safety ceiling for a genuine failure, never a sleep target.
+DEFAULT_SEARCH_POLL_TIMEOUT_SECONDS = 90.0
 DEFAULT_SEARCH_POLL_INTERVAL_SECONDS = 0.5
+
+# The single cheap field checked while waiting -- "Estado Cartera", proven
+# live (Fase 1B.3) to read empty before search and populated once the
+# result loads. A single-field readiness gate is a deliberate tradeoff: it
+# can occasionally wait longer than strictly necessary for an invoice where
+# this one field happens to stay blank while others populate (the final,
+# single full validation below still resolves that case correctly, just
+# after the full safety timeout instead of earlier).
+RESULT_READY_SENTINEL_AUTOMATION_ID = "INDtxtPortfolioStatus"
+SEARCH_INITIAL_DELAY_SECONDS = 2.0
+SEARCH_BACKOFF_SECONDS = 8.0
 
 
 class InvalidInvoiceValueError(Exception):
@@ -403,52 +424,118 @@ def validate_invoice_result_active(controls: list[ControlInfo]) -> tuple[bool, i
     return populated_count >= MIN_ACTIVE_FIELDS_THRESHOLD, populated_count
 
 
+def minimal_result_ready_check(window, max_wait_seconds: float) -> bool:
+    """Single cheap targeted UIA read -- NEVER a full tree walk.
+
+    Phase 1B close-out (GO_QUERY_REAL_WAIT_CONFIRMED): reads exactly ONE
+    result field's current value via
+    :func:`clinica_rpa.automation.go_session.uia_find_first_by_automation_id`,
+    the cheapest independent detector proven live in Fase 1B.3 (raw
+    ``FindFirst`` calls: 562-1969ms, versus 3-5s+ for a full
+    ``scan_window_controls`` walk). A transient failure (GO's UI thread
+    still busy, or the field not yet in the tree) is tolerated and treated
+    as "not ready yet", never raised.
+
+    The raw COM ``FindFirst`` call itself has no native timeout and can
+    block for as long as GO's UI thread stays unresponsive (review finding
+    R3-unbounded-com-findfirst) -- run it on a daemon thread and
+    ``join(timeout=max_wait_seconds)`` so the caller's own safety ceiling
+    is actually enforced end-to-end rather than only checked between
+    calls. A timed-out check reports "not ready yet"; its thread is
+    abandoned (daemon, never joined again), a deliberate, bounded leak
+    rather than an unenforceable wait.
+    """
+    result = {"ready": False}
+
+    def _check() -> None:
+        try:
+            element = uia_find_first_by_automation_id(window, RESULT_READY_SENTINEL_AUTOMATION_ID)
+            if not element:
+                return
+            value = uia_raw_element_name(element)
+            result["ready"] = bool(value and value.strip())
+        except Exception as exc:
+            # Review finding R3-sentinel-com-worker-thread-silent-failure:
+            # a bare `pass` here would make a worker-thread-specific COM
+            # failure (e.g. cross-apartment marshaling) indistinguishable
+            # from "GO just isn't ready yet", silently degrading every
+            # search to the full safety ceiling. Logged, never raised --
+            # the caller still treats this tick as "not ready".
+            logger.debug("minimal_result_ready_check worker thread error (tolerated): {!r}", exc)
+
+    thread = threading.Thread(target=_check, daemon=True)
+    thread.start()
+    thread.join(timeout=max(0.1, max_wait_seconds))
+    return result["ready"]
+
+
 def wait_for_search_result(
+    window,
     scan_fn,
     timeout_seconds: float = DEFAULT_SEARCH_POLL_TIMEOUT_SECONDS,
-    poll_interval: float = DEFAULT_SEARCH_POLL_INTERVAL_SECONDS,
+    initial_delay_seconds: float = SEARCH_INITIAL_DELAY_SECONDS,
+    backoff_seconds: float = SEARCH_BACKOFF_SECONDS,
 ) -> tuple[bool, bool, int]:
-    """Progressive, light, read-only poll after the Enter keystroke.
+    """Cheap read-only wait after the Enter keystroke, then ONE full
+    validation.
 
-    ``scan_fn()`` must return a fresh ``list[ControlInfo]`` snapshot (never a
-    deep tree walk more than once per tick). A transient scan failure is
-    tolerated and retried on the next tick.
+    Phase 1B close-out: Fase 1B.3's independent-detector diagnostic proved
+    GO's own UI thread becomes unresponsive to ANY UIA call for
+    ~42-46s while it resolves the query (GO_QUERY_REAL_WAIT_CONFIRMED) --
+    this is GO's real time, not a detection-strategy problem, and cannot be
+    optimized away from Python. This function therefore no longer repeats
+    an expensive ``scan_fn()`` (full tree walk) every tick -- it polls with
+    :func:`minimal_result_ready_check` (one cheap targeted field read) on a
+    long backoff, then calls ``scan_fn()`` and validates the full 16-field
+    result EXACTLY ONCE, either as soon as the sentinel looks ready or once
+    ``timeout_seconds`` (a safety ceiling for a genuine failure, never a
+    sleep target) is reached. If GO finishes before the sentinel would next
+    be checked, the loop still only sleeps up to ``backoff_seconds`` before
+    noticing.
 
-    Returns (active_enough, not_found_evidence, populated_count).
+    ``scan_fn()`` must return a fresh ``list[ControlInfo]`` snapshot.
+
+    Returns (active_enough, not_found_evidence, populated_count). Logs
+    ``GO_QUERY_WAIT_SECONDS`` (time spent waiting for the cheap sentinel)
+    separately from ``AUTOMATION_OVERHEAD_SECONDS`` (the one final full
+    validation's own cost) -- never mixed.
     """
     start = time.monotonic()
-    iterations = 0
-    scan_ms_total = 0.0
+    time.sleep(min(initial_delay_seconds, timeout_seconds))
+    ready = False
     while True:
-        iterations += 1
-        _scan_t0 = time.monotonic()
+        remaining = timeout_seconds - (time.monotonic() - start)
+        if remaining <= 0:
+            break
+        ready = minimal_result_ready_check(window, max_wait_seconds=remaining)
+        if ready:
+            break
+        remaining = timeout_seconds - (time.monotonic() - start)
+        if remaining <= 0:
+            break
+        time.sleep(min(backoff_seconds, remaining))
+    go_query_wait_seconds = time.monotonic() - start
+
+    # Bounded retry (review finding R3-single-shot-validation-after-sentinel):
+    # a single transient scan_fn() failure here must not immediately fail
+    # the whole search -- by this point GO's freeze should already be over,
+    # so a second attempt is cheap and expected to succeed.
+    _val_t0 = time.monotonic()
+    controls: list = []
+    for attempt in range(2):
         try:
             controls = scan_fn()
         except Exception:
             controls = []
-        scan_ms_total += (time.monotonic() - _scan_t0) * 1000.0
         if controls:
-            active_enough, populated_count = validate_invoice_result_active(controls)
-            not_found = check_not_found_evidence(controls)
-            if active_enough or not_found:
-                logger.info(
-                    "PERF POLL_LOOP invoice_result iterations={} scan_ms_total={:.0f}ms {:.0f}ms found=True",
-                    iterations, scan_ms_total, (time.monotonic() - start) * 1000.0,
-                )
-                return active_enough, not_found, populated_count
-        if time.monotonic() - start > timeout_seconds:
-            iterations += 1
-            _scan_t0 = time.monotonic()
-            try:
-                controls = scan_fn()
-            except Exception:
-                controls = []
-            scan_ms_total += (time.monotonic() - _scan_t0) * 1000.0
-            active_enough, populated_count = validate_invoice_result_active(controls) if controls else (False, 0)
-            not_found = check_not_found_evidence(controls) if controls else False
-            logger.info(
-                "PERF POLL_LOOP invoice_result iterations={} scan_ms_total={:.0f}ms {:.0f}ms found={}",
-                iterations, scan_ms_total, (time.monotonic() - start) * 1000.0, active_enough or not_found,
-            )
-            return active_enough, not_found, populated_count
-        time.sleep(poll_interval)
+            break
+        if attempt == 0:
+            time.sleep(1.0)
+    automation_overhead_seconds = time.monotonic() - _val_t0
+    active_enough, populated_count = validate_invoice_result_active(controls) if controls else (False, 0)
+    not_found = check_not_found_evidence(controls) if controls else False
+    logger.info(
+        "PERF GO_QUERY_WAIT_SECONDS {:.1f}s AUTOMATION_OVERHEAD_SECONDS {:.1f}s sentinel_ready={} found={}",
+        go_query_wait_seconds, automation_overhead_seconds, ready, active_enough or not_found,
+    )
+    return active_enough, not_found, populated_count
