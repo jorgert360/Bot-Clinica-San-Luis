@@ -444,10 +444,32 @@ def minimal_result_ready_check(window, max_wait_seconds: float) -> bool:
     calls. A timed-out check reports "not ready yet"; its thread is
     abandoned (daemon, never joined again), a deliberate, bounded leak
     rather than an unenforceable wait.
+
+    Fase 1C live regression (2026-09-25, TEST A/FHC245333) caught this
+    worker thread raising ``COMError(-2146233083, ...)`` ("catastrophic
+    failure") -- COM was never initialized on this brand-new thread before
+    touching a COM interface pointer created on the caller's thread. Fixed
+    generally (not per-symptom) by giving the worker thread its own COM
+    apartment via ``pythoncom.CoInitialize()``/``CoUninitialize()``, which
+    UI Automation's documented free-threading support allows even though
+    the pointer itself was created elsewhere.
     """
     result = {"ready": False}
 
     def _check() -> None:
+        import pythoncom
+
+        # Review finding R3-coinit-outside-try: CoInitialize() itself must
+        # never escape this thread uncaught either -- otherwise a failure
+        # here (e.g. RPC_E_CHANGED_MODE) would reach threading.excepthook
+        # instead of the tolerated "not ready yet" path below, breaking
+        # this function's documented never-raises contract. CoUninitialize
+        # only runs when CoInitialize actually succeeded.
+        try:
+            pythoncom.CoInitialize()
+        except Exception as exc:
+            logger.debug("minimal_result_ready_check CoInitialize failed (tolerated): {!r}", exc)
+            return
         try:
             element = uia_find_first_by_automation_id(window, RESULT_READY_SENTINEL_AUTOMATION_ID)
             if not element:
@@ -462,6 +484,8 @@ def minimal_result_ready_check(window, max_wait_seconds: float) -> bool:
             # search to the full safety ceiling. Logged, never raised --
             # the caller still treats this tick as "not ready".
             logger.debug("minimal_result_ready_check worker thread error (tolerated): {!r}", exc)
+        finally:
+            pythoncom.CoUninitialize()
 
     thread = threading.Thread(target=_check, daemon=True)
     thread.start()
