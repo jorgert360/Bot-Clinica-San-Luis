@@ -1,14 +1,23 @@
-"""Bot-San-Francisco -- Tk desktop GUI (Phase 1D).
+"""Bot-San-Francisco -- Tk desktop GUI (Phase 1D, extended Phase 1E).
 
 Pure presentation layer: this module only ever calls
-:func:`clinica_rpa.gui.worker.start_invoice_worker`, which itself only ever
-calls ``clinica_rpa.services.invoice_download_service.process_invoice``. No
-UIA/Win32/GO automation happens in this file.
+:func:`clinica_rpa.gui.worker.start_invoice_worker` (single invoice) and
+:func:`clinica_rpa.gui.batch_worker.start_batch_worker` (Excel batch), which
+themselves only ever call
+``clinica_rpa.services.invoice_download_service.process_invoice`` (directly,
+or via ``clinica_rpa.services.batch_invoice_service.process_batch`` for the
+per-NIT-folder batch case). No UIA/Win32/GO automation happens in this file.
 
-Threading discipline (Phase 1D spec, section 7): ``process_invoice`` runs on
-a background thread; this module (the Tk main thread) never blocks on it,
-and the worker thread never touches a Tk widget. The two communicate only
-through a ``queue.Queue``, drained here via ``root.after(...)``.
+Threading discipline (Phase 1D spec, section 7 -- unchanged for Phase 1E's
+batch tab): both `process_invoice` and the batch loop run on a background
+thread; this module (the Tk main thread) never blocks on them, and neither
+worker thread ever touches a Tk widget. Each communicates only through its
+own ``queue.Queue``, drained here via ``root.after(...)``.
+
+Phase 1E adds a second notebook tab ("Lote desde Excel") alongside the
+original single-invoice tab (Phase 1D, already live-tested against real GO)
+-- the single-invoice tab's own widgets/logic are unchanged. Both tabs share
+one ``busy`` flag so a batch and a single-invoice run can never overlap.
 """
 
 from __future__ import annotations
@@ -22,7 +31,9 @@ from tkinter import filedialog, messagebox, ttk
 
 from loguru import logger
 
-from clinica_rpa.gui import state
+from clinica_rpa.batch.excel_loader import BatchFormatInvalidError, BatchExcelSummary, load_invoice_batch
+from clinica_rpa.domain.models import BatchInvoiceItemResult, InvoiceBatchItem
+from clinica_rpa.gui import batch_worker, state
 from clinica_rpa.gui.worker import start_invoice_worker
 
 _POLL_INTERVAL_MS = 150
@@ -72,7 +83,11 @@ class BotSanFranciscoApp:
         self.root.geometry(_WINDOW_SIZE)
         self.root.minsize(600, 560)
 
+        # Shared across both tabs -- a single-invoice run and a batch run
+        # can never be active at the same time.
         self.busy = False
+
+        # Single-invoice tab state (Phase 1D, unchanged).
         self.destination_dir: Path | None = None
         self.result_queue: "queue.Queue" = queue.Queue()
         self.worker_thread = None
@@ -80,6 +95,20 @@ class BotSanFranciscoApp:
         self._timer_after_id: str | None = None
         self._poll_after_id: str | None = None
         self.last_pdf_path: str | None = None
+
+        # Batch tab state (Phase 1E).
+        self.batch_queue: "queue.Queue" = queue.Queue()
+        self.batch_worker_thread = None
+        self._batch_poll_after_id: str | None = None
+        self.batch_items: list[InvoiceBatchItem] = []
+        self.batch_summary: BatchExcelSummary | None = None
+        self.batch_excel_path: Path | None = None
+        self.batch_root_dir: Path | None = None
+        self.batch_total = 0
+        self.batch_index = 0
+        self.batch_completed_count = 0
+        self.batch_error_count = 0
+        self.batch_nit_seen: set[str] = set()
 
         self._build_ui()
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
@@ -105,6 +134,22 @@ class BotSanFranciscoApp:
 
         ttk.Separator(outer).pack(fill="x", pady=(0, 12))
 
+        notebook = ttk.Notebook(outer)
+        notebook.pack(fill="both", expand=True)
+
+        single_tab = ttk.Frame(notebook, padding=(0, 12, 0, 0))
+        notebook.add(single_tab, text="Factura individual")
+        self._build_single_invoice_tab(single_tab)
+
+        batch_tab = ttk.Frame(notebook, padding=(0, 12, 0, 0))
+        notebook.add(batch_tab, text="Lote desde Excel")
+        self._build_batch_tab(batch_tab)
+
+    # ------------------------------------------------------------------
+    # Single-invoice tab (Phase 1D, unchanged widgets/logic)
+    # ------------------------------------------------------------------
+
+    def _build_single_invoice_tab(self, outer: ttk.Frame) -> None:
         form = ttk.Frame(outer)
         form.pack(fill="x")
         form.columnconfigure(0, weight=1)
@@ -179,7 +224,7 @@ class BotSanFranciscoApp:
         self.open_pdf_btn.pack(side="left", padx=(8, 0))
 
     # ------------------------------------------------------------------
-    # Folder selection
+    # Folder selection (single-invoice tab)
     # ------------------------------------------------------------------
 
     def _select_folder(self) -> None:
@@ -190,7 +235,7 @@ class BotSanFranciscoApp:
         self.folder_var.set(str(self.destination_dir))
 
     # ------------------------------------------------------------------
-    # Validation + start
+    # Validation + start (single-invoice tab)
     # ------------------------------------------------------------------
 
     def _validate_inputs(self) -> tuple[str, Path] | None:
@@ -257,7 +302,8 @@ class BotSanFranciscoApp:
             self._timer_after_id = self.root.after(_TIMER_INTERVAL_MS, self._tick_timer)
 
     # ------------------------------------------------------------------
-    # Queue polling (the only place worker results reach Tk widgets)
+    # Queue polling (single-invoice tab -- the only place its worker
+    # results reach Tk widgets)
     # ------------------------------------------------------------------
 
     def _poll_queue(self) -> None:
@@ -284,7 +330,7 @@ class BotSanFranciscoApp:
         self._render_result(result)
 
     # ------------------------------------------------------------------
-    # Result rendering
+    # Result rendering (single-invoice tab)
     # ------------------------------------------------------------------
 
     def _reset_result_display(self) -> None:
@@ -332,7 +378,8 @@ class BotSanFranciscoApp:
         self.status_label.config(text="● " + label, foreground=color)
 
     # ------------------------------------------------------------------
-    # Controls enable/disable
+    # Controls enable/disable -- shared: toggles BOTH tabs, so a batch and
+    # a single-invoice run can never start while the other is busy.
     # ------------------------------------------------------------------
 
     def _set_controls_enabled(self, enabled: bool) -> None:
@@ -341,9 +388,16 @@ class BotSanFranciscoApp:
         self.select_folder_btn.config(state=widget_state)
         self.process_btn.config(state=widget_state)
 
+        self.batch_select_excel_btn.config(state=widget_state)
+        self.batch_select_folder_btn.config(state=widget_state)
+        if enabled:
+            self._update_batch_process_enabled()
+        else:
+            self.batch_process_btn.config(state="disabled")
+
     # ------------------------------------------------------------------
-    # Open folder / PDF -- native Windows mechanism only, never a shell
-    # command built from user input.
+    # Open folder / PDF (single-invoice tab) -- native Windows mechanism
+    # only, never a shell command built from user input.
     # ------------------------------------------------------------------
 
     def _open_folder(self) -> None:
@@ -362,8 +416,284 @@ class BotSanFranciscoApp:
         except OSError:
             messagebox.showerror(_WINDOW_TITLE, "No se pudo abrir el PDF.")
 
+    # ==================================================================
+    # Batch tab (Phase 1E)
+    # ==================================================================
+
+    def _build_batch_tab(self, outer: ttk.Frame) -> None:
+        file_frame = ttk.Frame(outer)
+        file_frame.pack(fill="x")
+        file_frame.columnconfigure(0, weight=1)
+
+        self.batch_select_excel_btn = ttk.Button(file_frame, text="Seleccionar Excel", command=self._on_select_excel)
+        self.batch_select_excel_btn.grid(row=0, column=0, sticky="w")
+
+        info_frame = ttk.Frame(outer)
+        info_frame.pack(fill="x", pady=(8, 0))
+        self.batch_file_var = tk.StringVar(value="-")
+        self.batch_records_var = tk.StringVar(value="-")
+        self.batch_nit_count_var = tk.StringVar(value="-")
+        ttk.Label(info_frame, text="Archivo:").grid(row=0, column=0, sticky="w")
+        ttk.Label(info_frame, textvariable=self.batch_file_var).grid(row=0, column=1, sticky="w", padx=(8, 0))
+        ttk.Label(info_frame, text="Registros:").grid(row=1, column=0, sticky="w")
+        ttk.Label(info_frame, textvariable=self.batch_records_var).grid(row=1, column=1, sticky="w", padx=(8, 0))
+        ttk.Label(info_frame, text="NIT diferentes:").grid(row=2, column=0, sticky="w")
+        ttk.Label(info_frame, textvariable=self.batch_nit_count_var).grid(row=2, column=1, sticky="w", padx=(8, 0))
+
+        self.batch_validation_label = ttk.Label(outer, text="", foreground="#c0392b", wraplength=560, justify="left")
+        self.batch_validation_label.pack(anchor="w", pady=(4, 8))
+
+        ttk.Separator(outer).pack(fill="x", pady=(0, 10))
+
+        root_row_label = ttk.Label(outer, text="Carpeta de destino")
+        root_row_label.pack(anchor="w")
+        root_row = ttk.Frame(outer)
+        root_row.pack(fill="x", pady=(2, 4))
+        root_row.columnconfigure(0, weight=1)
+        self.batch_root_var = tk.StringVar(value="")
+        self.batch_root_entry = ttk.Entry(root_row, textvariable=self.batch_root_var, state="readonly")
+        self.batch_root_entry.grid(row=0, column=0, sticky="ew")
+        self.batch_select_folder_btn = ttk.Button(root_row, text="Seleccionar", command=self._select_batch_root)
+        self.batch_select_folder_btn.grid(row=0, column=1, padx=(8, 0))
+
+        ttk.Label(
+            outer,
+            text="Las facturas se organizaran automaticamente en subcarpetas por NIT.",
+            font=("Segoe UI", 9, "italic"),
+            foreground="#555555",
+        ).pack(anchor="w")
+        ttk.Label(
+            outer, text="Organizacion: Destino\\NIT\\Factura.pdf", font=("Segoe UI", 9, "italic"), foreground="#555555"
+        ).pack(anchor="w", pady=(0, 10))
+
+        self.batch_process_btn = ttk.Button(outer, text="Procesar lote", command=self._on_batch_process_click, state="disabled")
+        self.batch_process_btn.pack(anchor="w")
+
+        ttk.Separator(outer).pack(fill="x", pady=12)
+
+        progress_frame = ttk.Frame(outer)
+        progress_frame.pack(fill="x")
+        self.batch_current_invoice_var = tk.StringVar(value="-")
+        self.batch_current_nit_var = tk.StringVar(value="-")
+        self.batch_progress_var = tk.StringVar(value="0 / 0")
+        self.batch_status_var = tk.StringVar(value=state.STATUS_LABELS[state.GuiState.IDLE])
+        ttk.Label(progress_frame, text="Procesando:").grid(row=0, column=0, sticky="w")
+        ttk.Label(progress_frame, textvariable=self.batch_current_invoice_var).grid(row=0, column=1, sticky="w", padx=(8, 0))
+        ttk.Label(progress_frame, text="NIT:").grid(row=1, column=0, sticky="w")
+        ttk.Label(progress_frame, textvariable=self.batch_current_nit_var).grid(row=1, column=1, sticky="w", padx=(8, 0))
+        ttk.Label(progress_frame, text="Factura:").grid(row=2, column=0, sticky="w")
+        ttk.Label(progress_frame, textvariable=self.batch_progress_var).grid(row=2, column=1, sticky="w", padx=(8, 0))
+        ttk.Label(progress_frame, text="Estado:").grid(row=3, column=0, sticky="w")
+        ttk.Label(progress_frame, textvariable=self.batch_status_var).grid(row=3, column=1, sticky="w", padx=(8, 0))
+
+        activity_frame = ttk.LabelFrame(outer, text="Actividad", padding=8)
+        activity_frame.pack(fill="both", expand=True, pady=(10, 0))
+        self.batch_activity_text = tk.Text(activity_frame, height=6, state="disabled", font=("Consolas", 9), wrap="none")
+        self.batch_activity_text.pack(fill="both", expand=True)
+
+        summary_frame = ttk.Frame(outer)
+        summary_frame.pack(fill="x", pady=(10, 0))
+        self.batch_summary_var = tk.StringVar(value="")
+        ttk.Label(summary_frame, textvariable=self.batch_summary_var, wraplength=560, justify="left").pack(anchor="w")
+        self.batch_root_label_var = tk.StringVar(value="")
+        ttk.Label(summary_frame, textvariable=self.batch_root_label_var, wraplength=560, justify="left").pack(anchor="w")
+
+        self.batch_open_folder_btn = ttk.Button(outer, text="Abrir carpeta", command=self._open_batch_folder, state="disabled")
+        self.batch_open_folder_btn.pack(anchor="w", pady=(8, 0))
+
     # ------------------------------------------------------------------
-    # Close protocol
+    # Excel selection + validation
+    # ------------------------------------------------------------------
+
+    def _on_select_excel(self) -> None:
+        chosen = filedialog.askopenfilename(title="Seleccionar archivo Excel", filetypes=[("Excel", "*.xlsx")])
+        if not chosen:
+            return
+        path = Path(chosen).resolve()
+        try:
+            items, summary = load_invoice_batch(path)
+        except BatchFormatInvalidError as exc:
+            self.batch_items = []
+            self.batch_summary = None
+            self.batch_excel_path = None
+            self.batch_file_var.set("-")
+            self.batch_records_var.set("-")
+            self.batch_nit_count_var.set("-")
+            self.batch_validation_label.config(text=exc.message_safe, foreground="#c0392b")
+            self._update_batch_process_enabled()
+            logger.warning("GUI BATCH: formato de Excel invalido: {}", exc.message_safe)
+            return
+
+        self.batch_items = items
+        self.batch_summary = summary
+        self.batch_excel_path = path
+        self.batch_file_var.set(path.name)
+        self.batch_records_var.set(str(summary.valid_count))
+        self.batch_nit_count_var.set(str(summary.distinct_nit_count))
+        if summary.invalid_rows:
+            self.batch_validation_label.config(
+                text=f"{len(summary.invalid_rows)} fila(s) invalida(s) seran omitidas.", foreground="#b58900"
+            )
+        else:
+            self.batch_validation_label.config(text="", foreground="#c0392b")
+        logger.info(
+            "GUI BATCH: Excel cargado (registros={}, nit_distintos={}, filas_invalidas={})",
+            summary.valid_count, summary.distinct_nit_count, len(summary.invalid_rows),
+        )
+        self._update_batch_process_enabled()
+
+    def _select_batch_root(self) -> None:
+        chosen = filedialog.askdirectory(title="Seleccionar carpeta raiz de destino")
+        if not chosen:
+            return
+        self.batch_root_dir = Path(chosen).resolve()
+        self.batch_root_var.set(str(self.batch_root_dir))
+        self._update_batch_process_enabled()
+
+    def _update_batch_process_enabled(self) -> None:
+        if self.busy:
+            self.batch_process_btn.config(state="disabled")
+            return
+        enabled = bool(self.batch_items) and self.batch_root_dir is not None
+        self.batch_process_btn.config(state="normal" if enabled else "disabled")
+
+    # ------------------------------------------------------------------
+    # Batch start
+    # ------------------------------------------------------------------
+
+    def _reset_batch_progress_display(self) -> None:
+        self.batch_activity_text.config(state="normal")
+        self.batch_activity_text.delete("1.0", "end")
+        self.batch_activity_text.config(state="disabled")
+        self.batch_current_invoice_var.set("-")
+        self.batch_current_nit_var.set("-")
+        self.batch_progress_var.set(f"0 / {self.batch_total}")
+        self.batch_summary_var.set("")
+        self.batch_root_label_var.set("")
+        self.batch_open_folder_btn.config(state="disabled")
+
+    def _on_batch_process_click(self) -> None:
+        if self.busy:
+            return
+        if not self.batch_items or self.batch_root_dir is None:
+            return
+
+        try:
+            self.batch_root_dir.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            self.batch_validation_label.config(text="No se pudo crear/usar la carpeta raiz seleccionada.", foreground="#c0392b")
+            return
+
+        self.busy = True
+        self.batch_total = len(self.batch_items)
+        self.batch_index = 0
+        self.batch_completed_count = 0
+        self.batch_error_count = 0
+        self.batch_nit_seen = set()
+        self._set_controls_enabled(False)
+        self._reset_batch_progress_display()
+        self.batch_status_var.set("Preparando...")
+
+        logger.info("GUI BATCH: iniciando lote ({} facturas)", self.batch_total)
+
+        self.batch_worker_thread = batch_worker.start_batch_worker(self.batch_items, self.batch_root_dir, self.batch_queue)
+        self.batch_status_var.set("Consultando factura en GO...")
+        self._poll_batch_queue()
+
+        # Same UX fix as the single-invoice tab (section 7/16): minimize
+        # our window and best-effort activate GO's, never touching GO
+        # beyond an OS-level focus switch.
+        self.root.iconify()
+        _best_effort_focus_go()
+
+    # ------------------------------------------------------------------
+    # Batch queue polling
+    # ------------------------------------------------------------------
+
+    def _poll_batch_queue(self) -> None:
+        try:
+            while True:
+                tag, payload = self.batch_queue.get_nowait()
+                if tag == batch_worker.ITEM_DONE:
+                    self._on_batch_item_done(payload)
+                elif tag == batch_worker.BATCH_DONE:
+                    self._on_batch_finished()
+                elif tag == batch_worker.BATCH_ERROR:
+                    self._on_batch_worker_error(payload)
+        except queue.Empty:
+            pass
+        if self.busy:
+            self._batch_poll_after_id = self.root.after(_POLL_INTERVAL_MS, self._poll_batch_queue)
+
+    def _on_batch_item_done(self, item_result: BatchInvoiceItemResult) -> None:
+        self.batch_index += 1
+        self.batch_nit_seen.add(item_result.nit)
+        if item_result.status == "COMPLETED":
+            self.batch_completed_count += 1
+            marker = "✓"
+            suffix = ""
+        else:
+            self.batch_error_count += 1
+            marker = "✗"
+            suffix = f" ({state.error_label_for(item_result.error_code)})"
+
+        self._append_activity_line(f"{marker} {item_result.invoice_number_masked} → {item_result.nit}{suffix}")
+
+        self.batch_progress_var.set(f"{self.batch_index} / {self.batch_total}")
+        self.batch_current_invoice_var.set(item_result.invoice_number_masked)
+        self.batch_current_nit_var.set(item_result.nit)
+        if self.batch_index < self.batch_total:
+            self.batch_status_var.set("Consultando factura en GO...")
+        else:
+            self.batch_status_var.set("Finalizando...")
+
+    def _on_batch_finished(self) -> None:
+        self.busy = False
+        self._set_controls_enabled(True)
+        self.root.deiconify()
+        self.root.lift()
+        self.batch_status_var.set("Procesamiento finalizado")
+        self.batch_summary_var.set(
+            f"Facturas: {self.batch_total}   Completadas: {self.batch_completed_count}   "
+            f"Errores: {self.batch_error_count}   NIT procesados: {len(self.batch_nit_seen)}"
+        )
+        if self.batch_root_dir is not None:
+            self.batch_root_label_var.set(f"Carpeta raiz: {self.batch_root_dir}")
+            self.batch_open_folder_btn.config(state="normal")
+        logger.info(
+            "GUI BATCH: finalizado (total={}, completadas={}, errores={}, nit_procesados={})",
+            self.batch_total, self.batch_completed_count, self.batch_error_count, len(self.batch_nit_seen),
+        )
+
+    def _on_batch_worker_error(self, message: str) -> None:
+        self.busy = False
+        self._set_controls_enabled(True)
+        self.root.deiconify()
+        self.root.lift()
+        self.batch_status_var.set("Error")
+        self.batch_validation_label.config(text=message, foreground="#c0392b")
+        logger.error("GUI BATCH: error inesperado del worker: {}", message)
+
+    def _append_activity_line(self, line: str) -> None:
+        self.batch_activity_text.config(state="normal")
+        self.batch_activity_text.insert("end", line + "\n")
+        self.batch_activity_text.see("end")
+        self.batch_activity_text.config(state="disabled")
+
+    # ------------------------------------------------------------------
+    # Open root folder (batch tab)
+    # ------------------------------------------------------------------
+
+    def _open_batch_folder(self) -> None:
+        if self.batch_root_dir is None:
+            return
+        try:
+            os.startfile(str(self.batch_root_dir))  # noqa: S606 - Windows-native, no shell involved
+        except OSError:
+            messagebox.showerror(_WINDOW_TITLE, "No se pudo abrir la carpeta raiz.")
+
+    # ------------------------------------------------------------------
+    # Close protocol (shared)
     # ------------------------------------------------------------------
 
     def _on_close(self) -> None:
@@ -374,6 +704,8 @@ class BotSanFranciscoApp:
             self.root.after_cancel(self._timer_after_id)
         if self._poll_after_id is not None:
             self.root.after_cancel(self._poll_after_id)
+        if self._batch_poll_after_id is not None:
+            self.root.after_cancel(self._batch_poll_after_id)
         self.root.destroy()
 
 

@@ -49,6 +49,33 @@ class InvoiceDownloadResult:
     stage_timings: list[StageTiming] = field(default_factory=list)
 
 
+@dataclass(frozen=True)
+class InvoiceBatchItem:
+    """One row from a validated batch source (Phase 1E), carrying the
+    invoice number and its NIT together so they can never desync into two
+    separate lists. ``nit`` is already normalized to a plain digit string
+    by the loader that produced this item."""
+
+    invoice_number: str
+    nit: str
+
+
+@dataclass(frozen=True)
+class BatchInvoiceItemResult:
+    """Outcome of one item within a batch (Phase 1E). Mirrors
+    :class:`InvoiceDownloadResult` but never carries a raw invoice number
+    (masked only) and adds the NIT used for folder routing. Never carries
+    any other Excel column's value (Regla 6)."""
+
+    invoice_number_masked: str
+    nit: str
+    status: str
+    pdf_path: str | None
+    elapsed_seconds: float
+    error_code: str | None
+    error_message_safe: str | None
+
+
 class GoState:
     """Closed vocabulary of GO/Indigo screen states relevant to this engine.
 
