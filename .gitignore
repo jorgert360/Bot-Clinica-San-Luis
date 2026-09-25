@@ -1,0 +1,26 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+.pytest_cache/
+*.egg-info/
+build/
+dist/
+
+# Environment / secrets
+.env
+credentials*
+secrets*
+
+# Runtime artifacts (never commit real output)
+runtime/
+downloads/
+screenshots/
+logs/
+*.pdf
+*.xlsx
+*.csv
+
+# Keep placeholder files so the runtime/ tree structure is visible in git
+!runtime/**/.gitkeep

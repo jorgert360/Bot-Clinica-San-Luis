@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "clinica-rpa"
+version = "0.0.1"
+description = "Phase-0 PoC for RPA automation of GO/Indigo invoice retrieval (clinic in Tulua, Colombia)."
+requires-python = ">=3.12"
+dependencies = [
+    "pywinauto>=0.6.8",
+    "pywin32>=306",
+    "psutil>=5.9",
+    "loguru>=0.7",
+    "pydantic>=2.0",
+    "python-dotenv>=1.0",
+    "comtypes>=1.2",
+    "pypdf>=5.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
