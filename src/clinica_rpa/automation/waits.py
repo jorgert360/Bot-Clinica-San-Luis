@@ -162,6 +162,32 @@ def win32_wait_for_window(
         time.sleep(poll_interval)
 
 
+def wait_until_window_closed(hwnd: int, timeout_seconds: float = 10.0, poll_interval: float = WIN32_POLL_INTERVAL_SECONDS) -> bool:
+    """Phase 1E.1: poll ``win32gui.IsWindow(hwnd)`` (zero UIA/COM) until it
+    reports False, or ``timeout_seconds`` elapses. Pairs with
+    :func:`clinica_rpa.automation.go_session.close_window_once`, whose
+    ``PostMessage(WM_CLOSE)`` is asynchronous -- callers must not proceed
+    to the next authorized action until this confirms the window is
+    actually gone. Returns True if closed, False on timeout (the caller
+    must treat a timeout as an unsafe/unknown state, never retry the
+    close)."""
+    import win32gui
+
+    start = time.monotonic()
+    while True:
+        try:
+            still_open = bool(win32gui.IsWindow(hwnd))
+        except Exception:
+            still_open = False
+        if not still_open:
+            logger.info("PERF WAIT_UNTIL_WINDOW_CLOSED {:.0f}ms closed=True", (time.monotonic() - start) * 1000.0)
+            return True
+        if time.monotonic() - start > timeout_seconds:
+            logger.info("PERF WAIT_UNTIL_WINDOW_CLOSED {:.0f}ms closed=False", (time.monotonic() - start) * 1000.0)
+            return False
+        time.sleep(poll_interval)
+
+
 def find_mdi_child_live(
     container,
     automation_id_hints: tuple[str, ...],

@@ -54,6 +54,12 @@ class ErrorCode:
     # retry would be dangerous -- this code means "abort, do not guess,
     # never attempt a second mechanism for that same action".
     UI_ACTION_AMBIGUOUS = "UI_ACTION_AMBIGUOUS"
+    # Phase 1E.1 (batch, between-items): the "Deshacer" button on the
+    # Trazabilidad result screen could not be resolved or verified before
+    # clicking -- the batch service must ABORT the whole batch on this
+    # code, never guess or keep clicking (spec: "si el estado de GO queda
+    # desconocido, ABORTAR, no continuar haciendo clicks").
+    RESET_SCREEN_FAILED = "RESET_SCREEN_FAILED"
 
     ALL: tuple[str, ...] = (
         GO_NOT_RUNNING,
@@ -74,6 +80,7 @@ class ErrorCode:
         PDF_INVALID,
         FINAL_DIALOG_TIMEOUT,
         UI_ACTION_AMBIGUOUS,
+        RESET_SCREEN_FAILED,
     )
 
 

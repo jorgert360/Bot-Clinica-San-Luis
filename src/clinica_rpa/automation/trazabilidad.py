@@ -19,11 +19,15 @@ from dataclasses import dataclass
 from loguru import logger
 
 from clinica_rpa.automation.go_session import (
+    LIVE_SEARCH_MAX_DEPTH,
+    LIVE_SEARCH_TIMEOUT_SECONDS,
     ControlInfo,
     Rect,
     WindowDiagnostic,
     _matches_any as matches_any,
+    activate_preselected_once,
     click_once,
+    connect_uia,
     load_calibration,
     locate_content_panel,
     resolve_target_point,
@@ -50,6 +54,12 @@ AUTOMATION_ID_SEARCH_TIMEOUT_SECONDS = 15.0
 GATE_TRAZABILIDAD = "trazabilidad de factura"
 GATE_INFORMACION_FACTURA = "informacion factura"
 LABEL_VARIANTS: tuple[str, ...] = ("n° factura", "nº factura", "no factura", "n factura")
+
+# Phase 1E.1 (batch, between-items): live-confirmed button (2026-09-25,
+# read-only UIA scan of the Trazabilidad result screen) -- named exactly
+# "Deshacer", no accents, no reject-variant needed since no other button on
+# this screen shares a normalized name with it.
+UNDO_BUTTON_VARIANTS: tuple[str, ...] = ("deshacer",)
 
 # The 16 result-detail fields (mirrors poc_search_invoice.FIELD_LABEL_VARIANTS).
 FIELD_LABEL_VARIANTS: dict[str, tuple[str, ...]] = {
@@ -222,6 +232,59 @@ def open_trazabilidad(go_window: WindowDiagnostic) -> None:
         raise ClinicaRpaError(
             ErrorCode.UI_ACTION_AMBIGUOUS, "El clic en el tile Trazabilidad de Factura fallo de forma ambigua."
         ) from exc
+
+
+# --------------------------------------------------------------------------
+# reset_result_screen_once(): the ONE authorized click on "Deshacer"
+# (Phase 1E.1, batch between-items). Live-confirmed 2026-09-25: after
+# downloading one invoice, GO's Trazabilidad result screen keeps that
+# invoice's data loaded and the invoice-number field refuses to accept a
+# new value (INVOICE_WRITE_FAILED, Regla 14: never overwrite blindly) until
+# this button clears it.
+# --------------------------------------------------------------------------
+
+
+def reset_result_screen_once(go_window: WindowDiagnostic) -> None:
+    """Click "Deshacer" exactly once so the invoice-number field becomes
+    writable again for the next batch item.
+
+    Foreground is verified immediately before the single click, exactly
+    like every other mutating action in this codebase. Per spec (Fase
+    1E.1 section 6/11): the caller must treat ANY failure here as "abort
+    the batch, never continue clicking" -- this function never retries a
+    second mechanism and never guesses.
+
+    Raises:
+        ClinicaRpaError(RESET_SCREEN_FAILED): the button could not be
+            resolved (0 or more than 1 candidate), or GO's foreground
+            could not be verified before the click.
+        ClinicaRpaError(UI_ACTION_AMBIGUOUS): the click itself raised
+            (Regla 2 -- may have already registered server-side).
+    """
+    from clinica_rpa.automation.dialogs import find_button_candidates_live
+    from clinica_rpa.automation.go_session import _classify_and_log
+
+    try:
+        window = connect_uia(go_window.handle)
+    except Exception as exc:
+        _classify_and_log(exc, "fallo al reconectar UIA para el clic en Deshacer")
+        raise ClinicaRpaError(ErrorCode.RESET_SCREEN_FAILED, "No se pudo conectar a la ventana de GO para el reinicio de pantalla.") from exc
+
+    candidates = find_button_candidates_live(window, UNDO_BUTTON_VARIANTS, (), LIVE_SEARCH_MAX_DEPTH, LIVE_SEARCH_TIMEOUT_SECONDS)
+    if len(candidates) != 1:
+        raise ClinicaRpaError(
+            ErrorCode.RESET_SCREEN_FAILED, f"{len(candidates)} candidatos 'Deshacer' (se requiere exactamente 1)."
+        )
+
+    undo_element = candidates[0]
+    try:
+        verify_go_foreground(go_window.handle, expected_pid=go_window.process_id)
+        activate_preselected_once(undo_element)
+    except Exception as exc:
+        _classify_and_log(exc, "fallo ejecutando el clic autorizado en Deshacer")
+        raise ClinicaRpaError(ErrorCode.UI_ACTION_AMBIGUOUS, "El clic en Deshacer fallo de forma ambigua.") from exc
+
+    logger.info("ACTION DESHACER CLICKED")
 
 
 # --------------------------------------------------------------------------

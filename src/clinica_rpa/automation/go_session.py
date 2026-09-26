@@ -440,6 +440,28 @@ def win32_pure_snapshot_hwnds(pid: int) -> set[int]:
     return found
 
 
+def close_window_once(hwnd: int) -> None:
+    """Send exactly one WM_CLOSE to ``hwnd`` -- the OS-level equivalent of
+    clicking that window's own close control. Never sends any other
+    message, never a second attempt.
+
+    Phase 1E.1 (batch, between-items): user-confirmed live (2026-09-25)
+    that GO's "Deshacer" button (see
+    :func:`clinica_rpa.automation.trazabilidad.reset_result_screen_once`)
+    only clears the loaded invoice once the "Visor de Reportes" window for
+    that invoice is closed first. Callers are responsible for having
+    already resolved ``hwnd`` to a window they intend to close (e.g. via
+    :func:`win32_pure_find_window` scoped to GO's own pid) -- this
+    function performs no discovery itself. ``PostMessage`` is
+    asynchronous: the window may not be gone yet when this call returns,
+    see :func:`wait_until_window_closed` in ``waits.py``.
+    """
+    import win32con
+    import win32gui
+
+    win32gui.PostMessage(hwnd, win32con.WM_CLOSE, 0, 0)
+
+
 def _search_content(controls: list[ControlInfo]) -> list[str]:
     haystack_parts = [f"{c.name} {c.automation_id} {c.class_name}" for c in controls]
     haystack = " ".join(haystack_parts)
