@@ -33,14 +33,33 @@ from loguru import logger
 
 from clinica_rpa.batch.excel_loader import BatchFormatInvalidError, BatchExcelSummary, load_invoice_batch
 from clinica_rpa.domain.models import BatchInvoiceItemResult, InvoiceBatchItem
-from clinica_rpa.gui import batch_worker, state
+from clinica_rpa.gui import batch_worker, state, theme
 from clinica_rpa.gui.worker import start_invoice_worker
 
 _POLL_INTERVAL_MS = 150
 _TIMER_INTERVAL_MS = 1000
 
 _WINDOW_TITLE = "Bot-San-Francisco"
-_WINDOW_SIZE = "650x600"
+_WINDOW_SIZE = "650x680"
+
+
+def _load_logo_image() -> tk.PhotoImage | None:
+    """Best-effort logo load (spec section 5: its absence must never block
+    the app). Native ``tkinter.PhotoImage`` (Tk 8.6+ reads PNG directly) --
+    deliberately NOT PIL, which is not a declared project dependency and
+    would need to ship with the packaged ``.exe``. Subsample factor is
+    computed from the image's own real dimensions, never a hardcoded
+    guess."""
+    try:
+        asset_path = Path(__file__).resolve().parent / theme.LOGO_PATH
+        image = tk.PhotoImage(file=str(asset_path))
+        factor = max(1, round(image.height() / theme.LOGO_TARGET_HEIGHT_PX))
+        if factor > 1:
+            image = image.subsample(factor, factor)
+        return image
+    except Exception as exc:  # noqa: BLE001 -- best-effort asset load only
+        logger.debug("No se pudo cargar el logo (tolerado): {!r}", exc)
+        return None
 
 
 def _best_effort_focus_go() -> None:
@@ -123,27 +142,44 @@ class BotSanFranciscoApp:
             style.theme_use("vista")
         except tk.TclError:
             pass  # fall back to whatever default ttk theme is available
+        style.configure("Primary.TButton", foreground=theme.WHITE, background=theme.PRIMARY, font=("Segoe UI", 10, "bold"))
+        style.map("Primary.TButton", background=[("active", theme.SECONDARY), ("disabled", theme.BORDER)])
 
+        self.root.configure(background=theme.LIGHT_BG)
         outer = ttk.Frame(self.root, padding=20)
         outer.pack(fill="both", expand=True)
 
-        title = ttk.Label(outer, text=_WINDOW_TITLE, font=("Segoe UI", 18, "bold"))
+        header = ttk.Frame(outer)
+        header.pack(fill="x", anchor="w")
+
+        # Best-effort logo -- its absence never blocks the header (section 5).
+        self._logo_image = _load_logo_image()
+        if self._logo_image is not None:
+            ttk.Label(header, image=self._logo_image).pack(anchor="w", pady=(0, 8))
+
+        title = ttk.Label(header, text=_WINDOW_TITLE, font=("Segoe UI", 18, "bold"), foreground=theme.PRIMARY_DARK)
         title.pack(anchor="w")
-        subtitle = ttk.Label(outer, text="Automatizacion de descarga de facturas", font=("Segoe UI", 10))
-        subtitle.pack(anchor="w", pady=(0, 12))
+        subtitle = ttk.Label(header, text="Automatizacion de descarga de facturas", font=("Segoe UI", 10))
+        subtitle.pack(anchor="w")
+        clinic_label = ttk.Label(header, text="Clinica San Francisco", font=("Segoe UI", 9), foreground=theme.SECONDARY)
+        clinic_label.pack(anchor="w", pady=(0, 12))
 
         ttk.Separator(outer).pack(fill="x", pady=(0, 12))
 
         notebook = ttk.Notebook(outer)
         notebook.pack(fill="both", expand=True)
 
-        single_tab = ttk.Frame(notebook, padding=(0, 12, 0, 0))
-        notebook.add(single_tab, text="Factura individual")
-        self._build_single_invoice_tab(single_tab)
-
+        # Excel batch processing is the PRIMARY, default-selected experience
+        # (spec section 3/18) -- added first so ttk.Notebook selects it by
+        # default. Single-invoice stays available as a clearly secondary,
+        # diagnostic-labeled tab; its own widgets/logic are unchanged.
         batch_tab = ttk.Frame(notebook, padding=(0, 12, 0, 0))
-        notebook.add(batch_tab, text="Lote desde Excel")
+        notebook.add(batch_tab, text="Procesamiento por Excel")
         self._build_batch_tab(batch_tab)
+
+        single_tab = ttk.Frame(notebook, padding=(0, 12, 0, 0))
+        notebook.add(single_tab, text="Prueba individual (avanzado)")
+        self._build_single_invoice_tab(single_tab)
 
     # ------------------------------------------------------------------
     # Single-invoice tab (Phase 1D, unchanged widgets/logic)
@@ -466,10 +502,15 @@ class BotSanFranciscoApp:
             outer, text="Organizacion: Destino\\NIT\\Factura.pdf", font=("Segoe UI", 9, "italic"), foreground="#555555"
         ).pack(anchor="w", pady=(0, 10))
 
-        self.batch_process_btn = ttk.Button(outer, text="Procesar lote", command=self._on_batch_process_click, state="disabled")
+        self.batch_process_btn = ttk.Button(
+            outer, text="Procesar facturas", command=self._on_batch_process_click, state="disabled", style="Primary.TButton"
+        )
         self.batch_process_btn.pack(anchor="w")
 
         ttk.Separator(outer).pack(fill="x", pady=12)
+
+        self.batch_progressbar = ttk.Progressbar(outer, orient="horizontal", mode="determinate", maximum=1, value=0)
+        self.batch_progressbar.pack(fill="x", pady=(0, 8))
 
         progress_frame = ttk.Frame(outer)
         progress_frame.pack(fill="x")
@@ -485,6 +526,11 @@ class BotSanFranciscoApp:
         ttk.Label(progress_frame, textvariable=self.batch_progress_var).grid(row=2, column=1, sticky="w", padx=(8, 0))
         ttk.Label(progress_frame, text="Estado:").grid(row=3, column=0, sticky="w")
         ttk.Label(progress_frame, textvariable=self.batch_status_var).grid(row=3, column=1, sticky="w", padx=(8, 0))
+
+        counters_frame = ttk.Frame(outer)
+        counters_frame.pack(fill="x", pady=(6, 0))
+        self.batch_counters_var = tk.StringVar(value="Completadas: 0   Errores: 0   Pendientes: 0")
+        ttk.Label(counters_frame, textvariable=self.batch_counters_var, font=("Segoe UI", 9, "bold")).pack(anchor="w")
 
         activity_frame = ttk.LabelFrame(outer, text="Actividad", padding=8)
         activity_frame.pack(fill="both", expand=True, pady=(10, 0))
@@ -568,6 +614,8 @@ class BotSanFranciscoApp:
         self.batch_current_invoice_var.set("-")
         self.batch_current_nit_var.set("-")
         self.batch_progress_var.set(f"0 / {self.batch_total}")
+        self.batch_counters_var.set(f"Completadas: 0   Errores: 0   Pendientes: {self.batch_total}")
+        self.batch_progressbar.config(maximum=max(1, self.batch_total), value=0)
         self.batch_summary_var.set("")
         self.batch_root_label_var.set("")
         self.batch_open_folder_btn.config(state="disabled")
@@ -642,6 +690,11 @@ class BotSanFranciscoApp:
         self.batch_progress_var.set(f"{self.batch_index} / {self.batch_total}")
         self.batch_current_invoice_var.set(item_result.invoice_number_masked)
         self.batch_current_nit_var.set(item_result.nit)
+        pending = max(0, self.batch_total - self.batch_index)
+        self.batch_counters_var.set(
+            f"Completadas: {self.batch_completed_count}   Errores: {self.batch_error_count}   Pendientes: {pending}"
+        )
+        self.batch_progressbar.config(value=self.batch_index)
         if self.batch_index < self.batch_total:
             self.batch_status_var.set("Consultando factura en GO...")
         else:

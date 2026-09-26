@@ -16,6 +16,7 @@ from pathlib import Path
 
 import openpyxl
 
+from clinica_rpa.domain.masking import mask_invoice
 from clinica_rpa.domain.models import InvoiceBatchItem
 
 SHEET_NAME = "VARIAS"
@@ -39,14 +40,6 @@ class BatchFormatInvalidError(Exception):
     def __init__(self, message_safe: str) -> None:
         super().__init__(message_safe)
         self.message_safe = message_safe
-
-
-def mask_invoice(value: str) -> str:
-    """First 3 + last 2 characters -- mirrors the engine's own masking
-    convention (Regla 6)."""
-    if len(value) <= 5:
-        return "*" * len(value)
-    return f"{value[:3]}{'*' * (len(value) - 5)}{value[-2:]}"
 
 
 @dataclass(frozen=True)

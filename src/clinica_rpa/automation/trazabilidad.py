@@ -36,6 +36,7 @@ from clinica_rpa.automation.go_session import (
     verify_go_foreground,
 )
 from clinica_rpa.domain.errors import ClinicaRpaError, ErrorCode
+from clinica_rpa.domain.masking import mask_invoice
 
 # --------------------------------------------------------------------------
 # Constants
@@ -125,20 +126,6 @@ class FieldSnapshot:
 # --------------------------------------------------------------------------
 # Privacy helper (Regla 6)
 # --------------------------------------------------------------------------
-
-
-def mask_invoice(value: str) -> str:
-    """Mask `value`, showing only the first 3 and last 2 characters.
-
-    For length <= 5 the ENTIRE value is masked. Result always has the same
-    length as the input. Empty string returns empty string.
-    """
-    length = len(value)
-    if length == 0:
-        return ""
-    if length <= 5:
-        return "*" * length
-    return value[:3] + ("*" * (length - 5)) + value[-2:]
 
 
 def validate_invoice_value(value: str) -> None:

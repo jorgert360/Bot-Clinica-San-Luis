@@ -7,6 +7,7 @@ is plain, independently testable logic used by :mod:`clinica_rpa.gui.app`.
 from __future__ import annotations
 
 from clinica_rpa.domain.errors import ErrorCode
+from clinica_rpa.domain.masking import mask_invoice as _mask_invoice
 
 
 class GuiState:
@@ -61,7 +62,7 @@ PROCESSING_HINT = (
 )
 BEFORE_START_HINT = "Verifique que GO este abierto, autenticado y visible."
 WHILE_PROCESSING_HINT = "No use la sesion de GO mientras el robot esta procesando."
-CLOSE_WHILE_BUSY_MESSAGE = "Hay una factura en procesamiento. Espere a que finalice."
+CLOSE_WHILE_BUSY_MESSAGE = "Hay un proceso en curso. Espere a que finalice."
 
 # GUI-safe error labels (Regla 6: never show raw tracebacks / clinical
 # content). Keys are ErrorCode string constants; "UNEXPECTED" covers the
@@ -123,12 +124,9 @@ def format_pages(pages: int | None) -> str:
 def mask_invoice_for_log(value: str) -> str:
     """Mask an invoice number for the GUI's own local log file (Regla 6).
 
-    Deliberately re-implemented here (not imported from
-    ``clinica_rpa.automation.trazabilidad``) so the ``gui`` package never
-    depends on the ``automation`` package -- masking is a privacy/format
-    convention, not automation logic. Shows only the first 3 and last 2
-    characters, mirroring the engine's own convention.
+    Phase 1E.2: delegates to the canonical
+    :func:`clinica_rpa.domain.masking.mask_invoice` -- ``gui`` still never
+    imports from ``automation`` (only from ``domain``, which has zero
+    dependencies), but the algorithm itself is no longer duplicated.
     """
-    if len(value) <= 5:
-        return "*" * len(value)
-    return f"{value[:3]}{'*' * (len(value) - 5)}{value[-2:]}"
+    return _mask_invoice(value)
