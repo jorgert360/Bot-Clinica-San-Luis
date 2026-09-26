@@ -144,8 +144,18 @@ def apply_theme(style: "ttk.Style") -> None:
     place. Called once from ``BotSanFranciscoApp._build_ui``."""
     import tkinter as tk
 
+    # "vista"/"xpnative" draw buttons with native Windows UxTheme chrome,
+    # which silently IGNORES ttk.Style's configured background on many
+    # Windows builds -- only the style DATABASE holds the right color
+    # (style.lookup(...) reads back correctly), the actual rendered pixels
+    # do not (live-confirmed 2026-09-25: "Seleccionar Excel" rendered
+    # near-invisible white-on-white despite a verified-correct
+    # Primary.TButton background, only showing color on native hover).
+    # "clam" is a fully Tk-drawn theme (no native chrome) that reliably
+    # respects configured colors -- required for this app's branded
+    # buttons to render correctly at all.
     try:
-        style.theme_use("vista")
+        style.theme_use("clam")
     except tk.TclError:
         pass  # fall back to whatever default ttk theme is available
 
