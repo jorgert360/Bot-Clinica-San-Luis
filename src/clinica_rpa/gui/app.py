@@ -1,4 +1,4 @@
-"""Bot-San-Francisco -- Tk desktop GUI (Phase 1D, extended Phase 1E).
+"""Bot-San-Francisco -- Tk desktop GUI (Phase 1D, extended Phase 1E/1F).
 
 Pure presentation layer: this module only ever calls
 :func:`clinica_rpa.gui.worker.start_invoice_worker` (single invoice) and
@@ -18,12 +18,18 @@ Phase 1E adds a second notebook tab ("Lote desde Excel") alongside the
 original single-invoice tab (Phase 1D, already live-tested against real GO)
 -- the single-invoice tab's own widgets/logic are unchanged. Both tabs share
 one ``busy`` flag so a batch and a single-invoice run can never overlap.
+
+Phase 1F redesigns the visual presentation (gradient header, card sections,
+styled tabs/buttons/progress bar) to match an approved mockup, and adds
+PyInstaller packaging support (frozen-path-aware asset loading below) -- no
+functional/threading/safety behavior changes.
 """
 
 from __future__ import annotations
 
 import os
 import queue
+import sys
 import time
 import tkinter as tk
 from pathlib import Path
@@ -40,18 +46,32 @@ _POLL_INTERVAL_MS = 150
 _TIMER_INTERVAL_MS = 1000
 
 _WINDOW_TITLE = "Bot-San-Francisco"
-_WINDOW_SIZE = "650x680"
+_WINDOW_SIZE = "700x760"
+_HEADER_HEIGHT_PX = 150
+_GRADIENT_STEPS = 80
+
+
+def _assets_base_dir() -> Path:
+    """Resolve the ``gui`` package's own directory for asset loading --
+    aware of PyInstaller's frozen bundle layout (``sys._MEIPASS``), so the
+    packaged ``.exe`` finds ``assets/`` exactly like running from source
+    does. The ``.spec`` file bundles ``src/clinica_rpa/gui/assets`` at
+    ``clinica_rpa/gui/assets`` inside the frozen bundle root."""
+    meipass = getattr(sys, "_MEIPASS", None)
+    if meipass:
+        return Path(meipass) / "clinica_rpa" / "gui"
+    return Path(__file__).resolve().parent
 
 
 def _load_logo_image() -> tk.PhotoImage | None:
     """Best-effort logo load (spec section 5: its absence must never block
     the app). Native ``tkinter.PhotoImage`` (Tk 8.6+ reads PNG directly) --
-    deliberately NOT PIL, which is not a declared project dependency and
+    deliberately NOT PIL, which is not a declared runtime dependency and
     would need to ship with the packaged ``.exe``. Subsample factor is
     computed from the image's own real dimensions, never a hardcoded
     guess."""
     try:
-        asset_path = Path(__file__).resolve().parent / theme.LOGO_PATH
+        asset_path = _assets_base_dir() / theme.LOGO_PATH
         image = tk.PhotoImage(file=str(asset_path))
         factor = max(1, round(image.height() / theme.LOGO_TARGET_HEIGHT_PX))
         if factor > 1:
@@ -100,7 +120,7 @@ class BotSanFranciscoApp:
         self.root = root
         self.root.title(_WINDOW_TITLE)
         self.root.geometry(_WINDOW_SIZE)
-        self.root.minsize(600, 560)
+        self.root.minsize(660, 640)
 
         # Shared across both tabs -- a single-invoice run and a batch run
         # can never be active at the same time.
@@ -138,48 +158,94 @@ class BotSanFranciscoApp:
 
     def _build_ui(self) -> None:
         style = ttk.Style(self.root)
-        try:
-            style.theme_use("vista")
-        except tk.TclError:
-            pass  # fall back to whatever default ttk theme is available
-        style.configure("Primary.TButton", foreground=theme.WHITE, background=theme.PRIMARY, font=("Segoe UI", 10, "bold"))
-        style.map("Primary.TButton", background=[("active", theme.SECONDARY), ("disabled", theme.BORDER)])
+        theme.apply_theme(style)
 
         self.root.configure(background=theme.LIGHT_BG)
-        outer = ttk.Frame(self.root, padding=20)
+        outer = ttk.Frame(self.root, padding=0)
         outer.pack(fill="both", expand=True)
 
-        header = ttk.Frame(outer)
-        header.pack(fill="x", anchor="w")
-
-        # Best-effort logo -- its absence never blocks the header (section 5).
         self._logo_image = _load_logo_image()
-        if self._logo_image is not None:
-            ttk.Label(header, image=self._logo_image).pack(anchor="w", pady=(0, 8))
+        self._build_header(outer)
 
-        title = ttk.Label(header, text=_WINDOW_TITLE, font=("Segoe UI", 18, "bold"), foreground=theme.PRIMARY_DARK)
-        title.pack(anchor="w")
-        subtitle = ttk.Label(header, text="Automatizacion de descarga de facturas", font=("Segoe UI", 10))
-        subtitle.pack(anchor="w")
-        clinic_label = ttk.Label(header, text="Clinica San Francisco", font=("Segoe UI", 9), foreground=theme.SECONDARY)
-        clinic_label.pack(anchor="w", pady=(0, 12))
+        body = ttk.Frame(outer, padding=theme.WINDOW_PADDING)
+        body.pack(fill="both", expand=True)
 
-        ttk.Separator(outer).pack(fill="x", pady=(0, 12))
-
-        notebook = ttk.Notebook(outer)
+        notebook = ttk.Notebook(body)
         notebook.pack(fill="both", expand=True)
 
         # Excel batch processing is the PRIMARY, default-selected experience
         # (spec section 3/18) -- added first so ttk.Notebook selects it by
         # default. Single-invoice stays available as a clearly secondary,
         # diagnostic-labeled tab; its own widgets/logic are unchanged.
-        batch_tab = ttk.Frame(notebook, padding=(0, 12, 0, 0))
-        notebook.add(batch_tab, text="Procesamiento por Excel")
+        batch_tab = ttk.Frame(notebook, padding=(0, 14, 0, 0))
+        notebook.add(batch_tab, text=f"  {theme.ICON_TAB_EXCEL}  Procesamiento por Excel  ")
         self._build_batch_tab(batch_tab)
 
-        single_tab = ttk.Frame(notebook, padding=(0, 12, 0, 0))
-        notebook.add(single_tab, text="Prueba individual (avanzado)")
+        single_tab = ttk.Frame(notebook, padding=(0, 14, 0, 0))
+        notebook.add(single_tab, text=f"  {theme.ICON_TAB_SINGLE}  Prueba individual (avanzado)  ")
         self._build_single_invoice_tab(single_tab)
+
+    # ------------------------------------------------------------------
+    # Header banner (Phase 1F): gradient tk.Canvas + logo + brand text.
+    # ------------------------------------------------------------------
+
+    def _build_header(self, parent: ttk.Frame) -> None:
+        canvas = tk.Canvas(parent, height=_HEADER_HEIGHT_PX, highlightthickness=0, bd=0)
+        canvas.pack(fill="x")
+        self._header_canvas = canvas
+
+        def _redraw(_event=None) -> None:
+            canvas.delete("gradient")
+            width = max(canvas.winfo_width(), 1)
+            colors = theme.gradient_colors(theme.HEADER_GRADIENT_START, theme.HEADER_GRADIENT_END, _GRADIENT_STEPS)
+            strip_width = width / len(colors)
+            for i, color in enumerate(colors):
+                x0 = i * strip_width
+                x1 = x0 + strip_width + 1
+                canvas.create_rectangle(x0, 0, x1, _HEADER_HEIGHT_PX, outline="", fill=color, tags="gradient")
+            canvas.tag_lower("gradient")
+
+        canvas.bind("<Configure>", _redraw)
+
+        logo_width = 0
+        if self._logo_image is not None:
+            canvas.create_image(24, _HEADER_HEIGHT_PX // 2, image=self._logo_image, anchor="w", tags="content")
+            logo_width = self._logo_image.width()
+
+        text_x = 24 + logo_width + (20 if logo_width else 0)
+        canvas.create_text(
+            text_x, 46, text=_WINDOW_TITLE, anchor="w", font=theme.FONT_TITLE, fill=theme.WHITE, tags="content"
+        )
+        canvas.create_text(
+            text_x, 78, text="Automatizacion de descarga de facturas", anchor="w",
+            font=theme.FONT_SUBTITLE, fill=theme.WHITE, tags="content",
+        )
+        canvas.create_text(
+            text_x, 100, text="Clinica San Francisco", anchor="w",
+            font=theme.FONT_CLINIC, fill=theme.HEADER_CLINIC_TEXT, tags="content",
+        )
+
+    # ------------------------------------------------------------------
+    # Card helper (Phase 1F): a plain tk.Frame border (reliable across
+    # ttk themes, unlike ttk.Frame's own borderwidth under "vista") with
+    # ttk-styled content inside it.
+    # ------------------------------------------------------------------
+
+    def _build_card(self, parent: ttk.Widget, icon: str, title: str, subtitle: str = "") -> ttk.Frame:
+        outer = tk.Frame(parent, bg=theme.WHITE, highlightbackground=theme.BORDER, highlightthickness=1, bd=0)
+        outer.pack(fill="x", pady=(0, theme.SECTION_SPACING))
+        inner = ttk.Frame(outer, padding=theme.CARD_PADDING, style="Card.TFrame")
+        inner.pack(fill="both", expand=True)
+
+        header_row = ttk.Frame(inner, style="Card.TFrame")
+        header_row.pack(fill="x")
+        ttk.Label(header_row, text=icon, style="CardIcon.TLabel").pack(side="left", padx=(0, 10), anchor="n")
+        text_col = ttk.Frame(header_row, style="Card.TFrame")
+        text_col.pack(side="left", fill="x", expand=True)
+        ttk.Label(text_col, text=title, style="CardTitle.TLabel").pack(anchor="w")
+        if subtitle:
+            ttk.Label(text_col, text=subtitle, style="CardSubtitle.TLabel").pack(anchor="w")
+        return inner
 
     # ------------------------------------------------------------------
     # Single-invoice tab (Phase 1D, unchanged widgets/logic)
@@ -453,99 +519,142 @@ class BotSanFranciscoApp:
             messagebox.showerror(_WINDOW_TITLE, "No se pudo abrir el PDF.")
 
     # ==================================================================
-    # Batch tab (Phase 1E)
+    # Batch tab (Phase 1E, redesigned Phase 1F)
     # ==================================================================
 
     def _build_batch_tab(self, outer: ttk.Frame) -> None:
-        file_frame = ttk.Frame(outer)
-        file_frame.pack(fill="x")
-        file_frame.columnconfigure(0, weight=1)
+        # -- Card 1: Archivo de Excel --------------------------------
+        excel_card = self._build_card(
+            outer, theme.ICON_EXCEL, "Archivo de Excel",
+            "Seleccione el archivo con el listado de facturas a procesar.",
+        )
+        excel_row = ttk.Frame(excel_card, style="Card.TFrame")
+        excel_row.pack(fill="x", pady=(12, 0))
+        self.batch_select_excel_btn = ttk.Button(
+            excel_row, text=f"{theme.ICON_EXCEL}  Seleccionar Excel", command=self._on_select_excel, style="Primary.TButton"
+        )
+        self.batch_select_excel_btn.pack(side="left", anchor="n")
 
-        self.batch_select_excel_btn = ttk.Button(file_frame, text="Seleccionar Excel", command=self._on_select_excel)
-        self.batch_select_excel_btn.grid(row=0, column=0, sticky="w")
-
-        info_frame = ttk.Frame(outer)
-        info_frame.pack(fill="x", pady=(8, 0))
+        info_frame = ttk.Frame(excel_row, style="Card.TFrame")
+        info_frame.pack(side="left", padx=(20, 0), anchor="n")
         self.batch_file_var = tk.StringVar(value="-")
         self.batch_records_var = tk.StringVar(value="-")
         self.batch_nit_count_var = tk.StringVar(value="-")
-        ttk.Label(info_frame, text="Archivo:").grid(row=0, column=0, sticky="w")
-        ttk.Label(info_frame, textvariable=self.batch_file_var).grid(row=0, column=1, sticky="w", padx=(8, 0))
-        ttk.Label(info_frame, text="Registros:").grid(row=1, column=0, sticky="w")
-        ttk.Label(info_frame, textvariable=self.batch_records_var).grid(row=1, column=1, sticky="w", padx=(8, 0))
-        ttk.Label(info_frame, text="NIT diferentes:").grid(row=2, column=0, sticky="w")
-        ttk.Label(info_frame, textvariable=self.batch_nit_count_var).grid(row=2, column=1, sticky="w", padx=(8, 0))
+        ttk.Label(info_frame, text="Archivo:", style="CardBodyBold.TLabel").grid(row=0, column=0, sticky="w")
+        ttk.Label(info_frame, textvariable=self.batch_file_var, style="CardBody.TLabel").grid(row=0, column=1, sticky="w", padx=(8, 0))
+        ttk.Label(info_frame, text="Registros:", style="CardBodyBold.TLabel").grid(row=1, column=0, sticky="w")
+        ttk.Label(info_frame, textvariable=self.batch_records_var, style="CardBody.TLabel").grid(row=1, column=1, sticky="w", padx=(8, 0))
+        ttk.Label(info_frame, text="NIT diferentes:", style="CardBodyBold.TLabel").grid(row=2, column=0, sticky="w")
+        ttk.Label(info_frame, textvariable=self.batch_nit_count_var, style="CardBody.TLabel").grid(row=2, column=1, sticky="w", padx=(8, 0))
 
-        self.batch_validation_label = ttk.Label(outer, text="", foreground="#c0392b", wraplength=560, justify="left")
-        self.batch_validation_label.pack(anchor="w", pady=(4, 8))
+        self.batch_validation_label = ttk.Label(excel_card, text="", foreground="#c0392b", background=theme.WHITE, wraplength=560, justify="left")
+        self.batch_validation_label.pack(anchor="w", pady=(10, 0))
 
-        ttk.Separator(outer).pack(fill="x", pady=(0, 10))
-
-        root_row_label = ttk.Label(outer, text="Carpeta de destino")
-        root_row_label.pack(anchor="w")
-        root_row = ttk.Frame(outer)
-        root_row.pack(fill="x", pady=(2, 4))
+        # -- Card 2: Carpeta de destino -------------------------------
+        folder_card = self._build_card(
+            outer, theme.ICON_FOLDER, "Carpeta de destino",
+            "Seleccione la carpeta donde se guardaran las facturas organizadas por NIT.",
+        )
+        root_row = ttk.Frame(folder_card, style="Card.TFrame")
+        root_row.pack(fill="x", pady=(12, 10))
         root_row.columnconfigure(0, weight=1)
         self.batch_root_var = tk.StringVar(value="")
         self.batch_root_entry = ttk.Entry(root_row, textvariable=self.batch_root_var, state="readonly")
         self.batch_root_entry.grid(row=0, column=0, sticky="ew")
-        self.batch_select_folder_btn = ttk.Button(root_row, text="Seleccionar", command=self._select_batch_root)
+        self.batch_select_folder_btn = ttk.Button(
+            root_row, text=f"{theme.ICON_FOLDER}  Seleccionar", command=self._select_batch_root, style="Secondary.TButton"
+        )
         self.batch_select_folder_btn.grid(row=0, column=1, padx=(8, 0))
 
+        info_banner = tk.Frame(folder_card, bg=theme.LIGHT_BG)
+        info_banner.pack(fill="x")
+        banner_inner = ttk.Frame(info_banner, style="InfoBanner.TFrame", padding=10)
+        banner_inner.pack(fill="x")
+        ttk.Label(banner_inner, text=f"{theme.ICON_INFO}", style="InfoBannerIcon.TLabel").grid(row=0, column=0, rowspan=2, sticky="nw", padx=(0, 8))
         ttk.Label(
-            outer,
-            text="Las facturas se organizaran automaticamente en subcarpetas por NIT.",
-            font=("Segoe UI", 9, "italic"),
-            foreground="#555555",
-        ).pack(anchor="w")
+            banner_inner, text="Las facturas se organizaran automaticamente en subcarpetas por NIT.", style="InfoBanner.TLabel"
+        ).grid(row=0, column=1, sticky="w")
         ttk.Label(
-            outer, text="Organizacion: Destino\\NIT\\Factura.pdf", font=("Segoe UI", 9, "italic"), foreground="#555555"
-        ).pack(anchor="w", pady=(0, 10))
+            banner_inner, text="Organizacion: Destino\\NIT\\factura.pdf", style="InfoBanner.TLabel"
+        ).grid(row=1, column=1, sticky="w")
 
+        # -- Primary action button -------------------------------------
         self.batch_process_btn = ttk.Button(
-            outer, text="Procesar facturas", command=self._on_batch_process_click, state="disabled", style="Primary.TButton"
+            outer, text=f"{theme.ICON_PLAY}  Procesar facturas", command=self._on_batch_process_click,
+            state="disabled", style="Primary.TButton",
         )
-        self.batch_process_btn.pack(anchor="w")
+        self.batch_process_btn.pack(anchor="w", pady=(0, theme.SECTION_SPACING))
 
-        ttk.Separator(outer).pack(fill="x", pady=12)
+        # -- Card 3: Progreso y estado -----------------------------------
+        progress_card = self._build_card(outer, theme.ICON_CHART, "Progreso y estado")
+        self.batch_status_header_var = tk.StringVar(value="")
+        ttk.Label(progress_card, textvariable=self.batch_status_header_var, style="CardBodyMuted.TLabel").pack(anchor="e")
 
-        self.batch_progressbar = ttk.Progressbar(outer, orient="horizontal", mode="determinate", maximum=1, value=0)
-        self.batch_progressbar.pack(fill="x", pady=(0, 8))
+        bar_row = ttk.Frame(progress_card, style="Card.TFrame")
+        bar_row.pack(fill="x", pady=(10, 10))
+        bar_row.columnconfigure(0, weight=1)
+        self.batch_progressbar = ttk.Progressbar(
+            bar_row, orient="horizontal", mode="determinate", maximum=1, value=0, style="Teal.Horizontal.TProgressbar"
+        )
+        self.batch_progressbar.grid(row=0, column=0, sticky="ew")
+        self.batch_percent_var = tk.StringVar(value="0%")
+        ttk.Label(bar_row, textvariable=self.batch_percent_var, style="CardBodyBold.TLabel").grid(row=0, column=1, padx=(10, 0))
 
-        progress_frame = ttk.Frame(outer)
+        progress_frame = ttk.Frame(progress_card, style="Card.TFrame")
         progress_frame.pack(fill="x")
+        for col in range(4):
+            progress_frame.columnconfigure(col, weight=1)
         self.batch_current_invoice_var = tk.StringVar(value="-")
         self.batch_current_nit_var = tk.StringVar(value="-")
         self.batch_progress_var = tk.StringVar(value="0 / 0")
         self.batch_status_var = tk.StringVar(value=state.STATUS_LABELS[state.GuiState.IDLE])
-        ttk.Label(progress_frame, text="Procesando:").grid(row=0, column=0, sticky="w")
-        ttk.Label(progress_frame, textvariable=self.batch_current_invoice_var).grid(row=0, column=1, sticky="w", padx=(8, 0))
-        ttk.Label(progress_frame, text="NIT:").grid(row=1, column=0, sticky="w")
-        ttk.Label(progress_frame, textvariable=self.batch_current_nit_var).grid(row=1, column=1, sticky="w", padx=(8, 0))
-        ttk.Label(progress_frame, text="Factura:").grid(row=2, column=0, sticky="w")
-        ttk.Label(progress_frame, textvariable=self.batch_progress_var).grid(row=2, column=1, sticky="w", padx=(8, 0))
-        ttk.Label(progress_frame, text="Estado:").grid(row=3, column=0, sticky="w")
-        ttk.Label(progress_frame, textvariable=self.batch_status_var).grid(row=3, column=1, sticky="w", padx=(8, 0))
+        for col, (label_text, var) in enumerate((
+            ("Procesando:", self.batch_current_invoice_var),
+            ("NIT:", self.batch_current_nit_var),
+            ("Factura:", self.batch_progress_var),
+            ("Estado:", self.batch_status_var),
+        )):
+            cell = ttk.Frame(progress_frame, style="Card.TFrame")
+            cell.grid(row=0, column=col, sticky="w", padx=(0 if col == 0 else 14, 0))
+            ttk.Label(cell, text=label_text, style="CardBodyMuted.TLabel").pack(anchor="w")
+            ttk.Label(cell, textvariable=var, style="CardBodyBold.TLabel").pack(anchor="w")
 
-        counters_frame = ttk.Frame(outer)
-        counters_frame.pack(fill="x", pady=(6, 0))
-        self.batch_counters_var = tk.StringVar(value="Completadas: 0   Errores: 0   Pendientes: 0")
-        ttk.Label(counters_frame, textvariable=self.batch_counters_var, font=("Segoe UI", 9, "bold")).pack(anchor="w")
+        # -- Counter chips ------------------------------------------------
+        chips_row = tk.Frame(progress_card, bg=theme.WHITE)
+        chips_row.pack(fill="x", pady=(14, 0))
+        self.batch_completed_var = tk.StringVar(value="Completadas: 0")
+        self.batch_errors_var = tk.StringVar(value="Errores: 0")
+        self.batch_pending_var = tk.StringVar(value="Pendientes: 0")
+        self._build_chip(chips_row, theme.ICON_SUCCESS, self.batch_completed_var, "ChipSuccess.TLabel").pack(side="left")
+        self._build_chip(chips_row, theme.ICON_ERROR, self.batch_errors_var, "ChipError.TLabel").pack(side="left", padx=(20, 0))
+        self._build_chip(chips_row, theme.ICON_PENDING, self.batch_pending_var, "ChipPending.TLabel").pack(side="left", padx=(20, 0))
 
+        # -- Activity panel ------------------------------------------------
         activity_frame = ttk.LabelFrame(outer, text="Actividad", padding=8)
-        activity_frame.pack(fill="both", expand=True, pady=(10, 0))
+        activity_frame.pack(fill="both", expand=True, pady=(0, theme.SECTION_SPACING))
         self.batch_activity_text = tk.Text(activity_frame, height=6, state="disabled", font=("Consolas", 9), wrap="none")
         self.batch_activity_text.pack(fill="both", expand=True)
 
         summary_frame = ttk.Frame(outer)
-        summary_frame.pack(fill="x", pady=(10, 0))
+        summary_frame.pack(fill="x", pady=(0, 8))
         self.batch_summary_var = tk.StringVar(value="")
-        ttk.Label(summary_frame, textvariable=self.batch_summary_var, wraplength=560, justify="left").pack(anchor="w")
+        ttk.Label(summary_frame, textvariable=self.batch_summary_var, wraplength=620, justify="left").pack(anchor="w")
         self.batch_root_label_var = tk.StringVar(value="")
-        ttk.Label(summary_frame, textvariable=self.batch_root_label_var, wraplength=560, justify="left").pack(anchor="w")
+        ttk.Label(summary_frame, textvariable=self.batch_root_label_var, wraplength=620, justify="left").pack(anchor="w")
 
-        self.batch_open_folder_btn = ttk.Button(outer, text="Abrir carpeta", command=self._open_batch_folder, state="disabled")
-        self.batch_open_folder_btn.pack(anchor="w", pady=(8, 0))
+        self.batch_open_folder_btn = ttk.Button(
+            outer, text=f"{theme.ICON_FOLDER}  Abrir carpeta", command=self._open_batch_folder,
+            state="disabled", style="Secondary.TButton",
+        )
+        self.batch_open_folder_btn.pack(anchor="w")
+
+    def _build_chip(self, parent: tk.Widget, icon: str, textvar: tk.StringVar, icon_style: str) -> ttk.Frame:
+        chip = tk.Frame(parent, bg=theme.LIGHT_BG)
+        inner = ttk.Frame(chip, style="InfoBanner.TFrame", padding=(10, 6))
+        inner.pack()
+        ttk.Label(inner, text=icon, style=icon_style).pack(side="left", padx=(0, 6))
+        ttk.Label(inner, textvariable=textvar, style="ChipText.TLabel").pack(side="left")
+        return chip
 
     # ------------------------------------------------------------------
     # Excel selection + validation
@@ -581,7 +690,7 @@ class BotSanFranciscoApp:
                 text=f"{len(summary.invalid_rows)} fila(s) invalida(s) seran omitidas.", foreground="#b58900"
             )
         else:
-            self.batch_validation_label.config(text="", foreground="#c0392b")
+            self.batch_validation_label.config(text=f"{theme.ICON_SUCCESS} Archivo valido", foreground="#1a7f37")
         logger.info(
             "GUI BATCH: Excel cargado (registros={}, nit_distintos={}, filas_invalidas={})",
             summary.valid_count, summary.distinct_nit_count, len(summary.invalid_rows),
@@ -614,8 +723,12 @@ class BotSanFranciscoApp:
         self.batch_current_invoice_var.set("-")
         self.batch_current_nit_var.set("-")
         self.batch_progress_var.set(f"0 / {self.batch_total}")
-        self.batch_counters_var.set(f"Completadas: 0   Errores: 0   Pendientes: {self.batch_total}")
+        self.batch_completed_var.set("Completadas: 0")
+        self.batch_errors_var.set("Errores: 0")
+        self.batch_pending_var.set(f"Pendientes: {self.batch_total}")
         self.batch_progressbar.config(maximum=max(1, self.batch_total), value=0)
+        self.batch_percent_var.set("0%")
+        self.batch_status_header_var.set("")
         self.batch_summary_var.set("")
         self.batch_root_label_var.set("")
         self.batch_open_folder_btn.config(state="disabled")
@@ -641,6 +754,7 @@ class BotSanFranciscoApp:
         self._set_controls_enabled(False)
         self._reset_batch_progress_display()
         self.batch_status_var.set("Preparando...")
+        self.batch_status_header_var.set("Procesamiento en curso...")
 
         logger.info("GUI BATCH: iniciando lote ({} facturas)", self.batch_total)
 
@@ -691,10 +805,12 @@ class BotSanFranciscoApp:
         self.batch_current_invoice_var.set(item_result.invoice_number_masked)
         self.batch_current_nit_var.set(item_result.nit)
         pending = max(0, self.batch_total - self.batch_index)
-        self.batch_counters_var.set(
-            f"Completadas: {self.batch_completed_count}   Errores: {self.batch_error_count}   Pendientes: {pending}"
-        )
+        self.batch_completed_var.set(f"Completadas: {self.batch_completed_count}")
+        self.batch_errors_var.set(f"Errores: {self.batch_error_count}")
+        self.batch_pending_var.set(f"Pendientes: {pending}")
         self.batch_progressbar.config(value=self.batch_index)
+        percent = int(round(100 * self.batch_index / self.batch_total)) if self.batch_total else 0
+        self.batch_percent_var.set(f"{percent}%")
         if self.batch_index < self.batch_total:
             self.batch_status_var.set("Consultando factura en GO...")
         else:
@@ -706,6 +822,7 @@ class BotSanFranciscoApp:
         self.root.deiconify()
         self.root.lift()
         self.batch_status_var.set("Procesamiento finalizado")
+        self.batch_status_header_var.set("")
         self.batch_summary_var.set(
             f"Facturas: {self.batch_total}   Completadas: {self.batch_completed_count}   "
             f"Errores: {self.batch_error_count}   NIT procesados: {len(self.batch_nit_seen)}"
@@ -724,6 +841,7 @@ class BotSanFranciscoApp:
         self.root.deiconify()
         self.root.lift()
         self.batch_status_var.set("Error")
+        self.batch_status_header_var.set("")
         self.batch_validation_label.config(text=message, foreground="#c0392b")
         logger.error("GUI BATCH: error inesperado del worker: {}", message)
 

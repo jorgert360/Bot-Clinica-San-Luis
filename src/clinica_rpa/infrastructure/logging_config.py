@@ -51,7 +51,13 @@ def setup_logging(log_dir: Path | str | None = None, level: str | None = None) -
     resolved_log_dir.mkdir(parents=True, exist_ok=True)
 
     logger.remove()
-    logger.add(sys.stderr, level=resolved_level, backtrace=False, diagnose=False)
+    # A PyInstaller windowed build (console=False, Fase 1F) has no
+    # attached console -- sys.stderr is None there, and loguru raises
+    # ("Cannot log to objects of type 'NoneType'") if handed it directly.
+    # Live-confirmed: the packaged Bot-San-Francisco.exe crashed on launch
+    # with exactly this error before this guard was added.
+    if sys.stderr is not None:
+        logger.add(sys.stderr, level=resolved_level, backtrace=False, diagnose=False)
     logger.add(
         resolved_log_dir / _LOG_FILE_NAME,
         level=resolved_level,
